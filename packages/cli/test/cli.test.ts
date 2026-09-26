@@ -145,7 +145,7 @@ describe('lr list', () => {
     expect((await lr(['status'], { cwd: join(root, 'src') })).out).toContain('1 thread waiting for you');
     const none = await lr(['list'], { cwd: tmpdir() });
     expect(none.code).toBe(EXIT.ERROR);
-    expect(none.err).toContain('no .local-review/ found');
+    expect(none.err).toContain('no Local Review store in');
   });
 });
 
@@ -224,5 +224,69 @@ describe('lr show / usage', () => {
     await lr(['reply', t.id, '--agent', 'Claude', '--body', 'y']);
     const lines = (await readFile(store.threadFile(t.id), 'utf8')).trimEnd().split('\n');
     expect(lines.map((l) => JSON.parse(l).type)).toEqual(['thread.created', 'comment.added', 'comment.added']);
+  });
+});
+
+describe('lr sessions', () => {
+  it('registers, lists, touches and unregisters sessions in LOCAL_REVIEW_HOME', async () => {
+    const env = { LOCAL_REVIEW_HOME: join(root, 'home') };
+    expect((await lr(['sessions'], { env })).out).toContain('No agent session is running');
+
+    const reg = await lr(
+      ['session', 'register', '--id', 'abc-123', '--agent', 'Claude', '--cwd', 'src', '--branch', 'feature-x'],
+      { env },
+    );
+    expect(reg.code).toBe(EXIT.OK);
+    await lr(['session', 'touch', '--id', 'abc-123', 'src/find.ts'], { env });
+
+    const listed = JSON.parse((await lr(['sessions', '--format', 'json'], { env })).out);
+    expect(listed).toMatchObject([
+      {
+        id: 'abc-123',
+        agent: 'Claude',
+        cwd: join(root, 'src'),
+        branch: 'feature-x',
+        pid: null,
+        touched: [join(root, 'src', 'find.ts')],
+      },
+    ]);
+    expect((await lr(['sessions'], { env })).out).toContain('Claude · feature-x');
+
+    await lr(['session', 'unregister', '--id', 'abc-123'], { env });
+    expect((await lr(['sessions'], { env })).out).toContain('No agent session is running');
+  });
+
+  it('rejects bad input', async () => {
+    const env = { LOCAL_REVIEW_HOME: join(root, 'home') };
+    expect((await lr(['session', 'register', '--agent', 'Claude'], { env })).err).toContain('--id');
+    expect((await lr(['session', 'register', '--id', 'x', '--agent', 'Claude', '--pid', 'abc'], { env })).code).toBe(
+      EXIT.ERROR,
+    );
+    expect((await lr(['session', 'fly', '--id', 'x'], { env })).code).toBe(EXIT.ERROR);
+  });
+});
+
+describe('lr from a folder without a store', () => {
+  it('says so, instead of taking the per-machine folder for an empty store', async () => {
+    // ~/.local-review holds the session registry, not comments.
+    const home = join(root, 'home');
+    await mkdir(join(home, '.local-review', 'sessions'), { recursive: true });
+    await mkdir(join(home, 'work'), { recursive: true });
+    const env = { LOCAL_REVIEW_HOME: join(home, '.local-review') };
+    const r = await lr(['status'], { cwd: join(home, 'work'), env });
+    expect(r.code).toBe(EXIT.ERROR);
+    expect(r.err).toContain('no Local Review store in');
+    expect(r.out).toBe('');
+  });
+
+  it('lists the stores below, e.g. the repositories of a parent folder', async () => {
+    const repo = join(root, 'parent', 'repo');
+    await new Store(repo).createThread(anchorOn(3, 3), { author: 'user', body: 'in the repo', reviewId: null });
+    const env = { LOCAL_REVIEW_HOME: join(root, 'nowhere') };
+    const r = await lr(['status'], { cwd: join(root, 'parent'), env });
+    expect(r.code).toBe(EXIT.ERROR);
+    expect(r.err).toContain('Stores below this folder');
+    expect(r.err).toContain(repo);
+    expect((await lr(['status', '--root', repo], { env })).out).toContain('1 thread waiting for you');
   });
 });
