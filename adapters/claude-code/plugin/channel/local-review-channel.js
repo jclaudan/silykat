@@ -8,6 +8,11 @@ var import_node_readline = require("node:readline");
 var import_promises = require("node:fs/promises");
 var import_node_os = require("node:os");
 var import_node_path = require("node:path");
+
+// ../../packages/core/src/topics.ts
+var topicKey = (t) => t.kind === "branch" ? `branch:${t.repo}#${t.branch}` : `path:${t.path}`;
+
+// ../../packages/core/src/sessions.ts
 function localReviewHome(env = process.env) {
   return env.LOCAL_REVIEW_HOME?.trim() || (0, import_node_path.join)((0, import_node_os.homedir)(), ".local-review");
 }
@@ -39,18 +44,81 @@ var SessionRegistry = class {
     await (0, import_promises.writeFile)(tmp, JSON.stringify(record, null, 2) + "\n");
     await (0, import_promises.rename)(tmp, target);
   }
+  /** Everything the registry keeps about a session goes with it. */
   async unregister(id) {
-    await (0, import_promises.rm)(this.file(id, "json"), { force: true });
-    await (0, import_promises.rm)(this.file(id, "touched"), { force: true });
-    await (0, import_promises.rm)(this.file(id, "inbox"), { force: true });
+    this.file(id, "json");
+    let names = [];
+    try {
+      names = await (0, import_promises.readdir)(this.dir);
+    } catch {
+      return;
+    }
+    await Promise.all(names.filter((n) => n.startsWith(`${id}.`)).map((n) => (0, import_promises.rm)((0, import_node_path.join)(this.dir, n), { force: true })));
   }
-  /** Records that a session wrote a file. Appended, so concurrent hooks never lose an entry. */
-  async touch(id, absolutePath) {
+  /** A small note an adapter keeps about a session between two hooks (removed with the session). */
+  async setNote(id, key, value) {
     await (0, import_promises.mkdir)(this.dir, { recursive: true });
-    await (0, import_promises.appendFile)(
-      this.file(id, "touched"),
-      JSON.stringify({ path: absolutePath, at: (/* @__PURE__ */ new Date()).toISOString() }) + "\n"
-    );
+    await (0, import_promises.writeFile)(this.note(id, key), value);
+  }
+  /** Reads and removes a note; `undefined` when there is none. */
+  async takeNote(id, key) {
+    const file = this.note(id, key);
+    try {
+      const value = await (0, import_promises.readFile)(file, "utf8");
+      await (0, import_promises.rm)(file, { force: true });
+      return value;
+    } catch {
+      return void 0;
+    }
+  }
+  note(id, key) {
+    if (!SESSION_ID.test(key)) throw new Error(`Invalid note key: ${key}`);
+    this.file(id, "json");
+    return (0, import_node_path.join)(this.dir, `${id}.note-${key}`);
+  }
+  /**
+   * Subscribes a session to a topic. Resolves to `true` when it was not subscribed yet (e.g. to tell
+   * the agent). Appended, so concurrent hooks never lose an entry.
+   */
+  async subscribe(id, topic, reason) {
+    const already = (await this.subscriptions(id)).some((s) => topicKey(s.topic) === topicKey(topic));
+    if (already) return false;
+    await this.appendSubscription(id, { op: "add", topic, reason, at: (/* @__PURE__ */ new Date()).toISOString() });
+    return true;
+  }
+  /** Unsubscribes a session from a topic, or from everything. Resolves to what it was subscribed to. */
+  async unsubscribe(id, topic) {
+    const current = await this.subscriptions(id);
+    const gone = topic === "all" ? current : current.filter((s) => topicKey(s.topic) === topicKey(topic));
+    for (const s of gone)
+      await this.appendSubscription(id, { op: "remove", topic: s.topic, at: (/* @__PURE__ */ new Date()).toISOString() });
+    return gone;
+  }
+  /** What a session is subscribed to, oldest first. */
+  async subscriptions(id) {
+    let text;
+    try {
+      text = await (0, import_promises.readFile)(this.file(id, "subscriptions"), "utf8");
+    } catch {
+      return [];
+    }
+    const current = /* @__PURE__ */ new Map();
+    for (const line of text.split("\n")) {
+      try {
+        const e = JSON.parse(line);
+        if (!e.topic || e.topic.kind !== "branch" && e.topic.kind !== "path") continue;
+        const key = topicKey(e.topic);
+        if (e.op === "remove") current.delete(key);
+        else if (e.op === "add" && !current.has(key))
+          current.set(key, { topic: e.topic, reason: e.reason ?? "user", at: e.at ?? "" });
+      } catch {
+      }
+    }
+    return [...current.values()];
+  }
+  async appendSubscription(id, event) {
+    await (0, import_promises.mkdir)(this.dir, { recursive: true });
+    await (0, import_promises.appendFile)(this.file(id, "subscriptions"), JSON.stringify(event) + "\n");
   }
   /** Hands threads to a session. Appended to its inbox, which its agent's adapter watches. */
   async deliver(id, delivery) {
@@ -102,31 +170,9 @@ var SessionRegistry = class {
         await this.unregister(record.id).catch(() => void 0);
         continue;
       }
-      sessions.push({ ...record, touched: await this.readTouched(record.id) });
+      sessions.push({ ...record, subscriptions: await this.subscriptions(record.id) });
     }
     return sessions;
-  }
-  async readTouched(id) {
-    let text;
-    try {
-      text = await (0, import_promises.readFile)(this.file(id, "touched"), "utf8");
-    } catch {
-      return [];
-    }
-    const paths = [];
-    for (const line of text.split("\n")) {
-      try {
-        const { path } = JSON.parse(line);
-        if (typeof path === "string") paths.push(path);
-      } catch {
-      }
-    }
-    const order = /* @__PURE__ */ new Map();
-    for (const p of paths) {
-      order.delete(p);
-      order.set(p, true);
-    }
-    return [...order.keys()];
   }
 };
 async function readRecord(file) {
@@ -159,7 +205,8 @@ function parseDelivery(line) {
       root: raw.root,
       kind,
       threadIds: raw.threadIds.filter((t) => typeof t === "string"),
-      ...typeof raw.reviewId === "string" ? { reviewId: raw.reviewId } : {}
+      ...typeof raw.reviewId === "string" ? { reviewId: raw.reviewId } : {},
+      ...Array.isArray(raw.recipients) ? { recipients: raw.recipients.filter((r) => typeof r === "string") } : {}
     };
   } catch {
     return null;
@@ -171,9 +218,10 @@ var BATCH_MS = 1500;
 var SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
 var INSTRUCTIONS = [
   "Local Review is the local code review tool the user works with in VS Code.",
-  'When the user publishes comments there, they arrive as <channel source="...local-review..." store="<folder>">.',
+  'When the user publishes comments there, they arrive as <channel source="...local-review..." store="<folder>" threads="<ids>">.',
   "Process them right away, without waiting to be asked: follow the local-review review skill",
-  "(/local-review:review), passing `--root <folder>` (the store attribute) to every `lr` command.",
+  "(/local-review:review), passing `--root <folder>` (the store attribute) to every `lr` command, and listing only",
+  "those threads (`lr list --root <folder> --thread <id> --thread <id>\u2026`): others may be for another session.",
   "Answer in the threads with `lr reply`; nothing needs to be sent back through the channel."
 ].join(" ");
 var LocalReviewChannel = class {
@@ -253,7 +301,15 @@ var LocalReviewChannel = class {
       this.deps.send({
         jsonrpc: "2.0",
         method: "notifications/claude/channel",
-        params: { content: describe(root, deliveries), meta: { store: root } }
+        params: {
+          content: describe(root, deliveries),
+          meta: {
+            store: root,
+            threads: threadIds(deliveries).join(" "),
+            // Every session these comments went to (e.g. a developer and a reviewer): for debugging.
+            recipients: [...new Set(deliveries.flatMap((d) => d.recipients ?? []))].join(" ")
+          }
+        }
       });
     }
   }
@@ -263,15 +319,17 @@ var LocalReviewChannel = class {
   }
 };
 function describe(root, deliveries) {
-  const threads = new Set(deliveries.flatMap((d) => d.threadIds)).size;
+  const ids = threadIds(deliveries);
+  const threads = ids.length;
   const reviews = deliveries.filter((d) => d.kind === "review").length;
   const comments = deliveries.filter((d) => d.kind === "comment").length;
   const replies = deliveries.filter((d) => d.kind === "reply").length;
   const what = [count(reviews, "review"), count(comments, "new comment"), count(replies, "reply", "replies")].filter(
     (s) => s !== ""
   );
-  return `The user published ${joinList(what)} in Local Review (${count(threads, "thread")}), in ${root}. Process them now with the local-review review skill, running every lr command with --root ${JSON.stringify(root)}.`;
+  return `The user published ${joinList(what)} in Local Review (${count(threads, "thread")}), in ${root}. Process them now with the local-review review skill, running every lr command with --root ${JSON.stringify(root)}, and listing only these threads: lr list --root ${JSON.stringify(root)} ${ids.map((id) => `--thread ${id}`).join(" ")}`;
 }
+var threadIds = (deliveries) => [...new Set(deliveries.flatMap((d) => d.threadIds))];
 var count = (n, one, many = `${one}s`) => n === 0 ? "" : n === 1 && one === "review" ? "a review" : `${n} ${n === 1 ? one : many}`;
 var joinList = (parts) => parts.length <= 1 ? parts[0] ?? "" : `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
 
@@ -310,7 +368,7 @@ async function main() {
     claudePid: await findClaudePid(process.ppid),
     send: (message) => process.stdout.write(JSON.stringify(message) + "\n"),
     now: () => Date.now(),
-    version: "0.3.0"
+    version: "0.5.0"
   });
   const lines = (0, import_node_readline.createInterface)({ input: process.stdin });
   lines.on("line", (line) => {

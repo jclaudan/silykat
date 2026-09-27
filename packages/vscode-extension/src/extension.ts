@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { AgentRepliesUi, type Notifier } from './agentReplies';
 import { ReviewController, type ChooseHandler, type ConfirmHandler } from './controller';
 import { simulateAgentReply, type SimulateArgs } from './dev/simulateAgentReply';
-import { DeliveriesUi, type Warner } from './deliveries';
+import { DeliveriesUi, type NoSubscriberPrompt, type Warner } from './deliveries';
 import { createLog } from './log';
 import type { LrComment } from './render';
 import { ReviewUi, type SummaryPrompt } from './review';
@@ -31,8 +31,10 @@ export interface LocalReviewApi {
   refreshSessions(): Promise<{ statusText: string | undefined; all: string[]; relevant: string[] }>;
   /** Tests only: the agent sessions shown right now, as last polled. */
   shownSessions(): string[];
-  /** Tests only: capture the warnings about deliveries (return the action to click). */
+  /** Tests only: capture the messages about deliveries (return the action to click). */
   setDeliveryWarner(warner: Warner | undefined): void;
+  /** Tests only: answer "publish without subscribers?" without showing it. */
+  setNoSubscriberPrompt(prompt: NoSubscriberPrompt | undefined): void;
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<LocalReviewApi> {
@@ -95,6 +97,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<LocalR
   const defaultSummaryPrompt = reviewUi.promptSummary;
   const defaultNotifier = agentReplies.notify;
   const defaultWarner = deliveries.warn;
+  const defaultNoSubscriberPrompt = deliveries.askNoSubscriber;
   await review.reload();
   log.info('Local Review activated');
 
@@ -121,6 +124,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<LocalR
     awaitingUser: () => review.awaitingUser(),
     setDeliveryWarner: (warner) => {
       deliveries.warn = warner ?? defaultWarner;
+    },
+    setNoSubscriberPrompt: (prompt) => {
+      deliveries.askNoSubscriber = prompt ?? defaultNoSubscriberPrompt;
     },
     shownSessions: () => sessions.sessions.relevant.map((s) => s.id),
     refreshSessions: async () => {

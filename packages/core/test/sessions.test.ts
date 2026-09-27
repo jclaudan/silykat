@@ -2,7 +2,19 @@ import { mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { deliveryTarget, localReviewHome, relevantSessions, SessionRegistry, type SessionRecord } from '../src/index';
+import {
+  filesChangedSince,
+  localReviewHome,
+  relevantSessions,
+  SessionRegistry,
+  subscribersOf,
+  topicLabel,
+  topicOf,
+  type Session,
+  type SessionRecord,
+  type Subscription,
+  type Topic,
+} from '../src/index';
 
 let home: string;
 const alive = new Set<number>([1111, 2222]);
@@ -58,15 +70,6 @@ describe('SessionRegistry', () => {
     expect(await r.list()).toHaveLength(1);
   });
 
-  it('records the files a session wrote, each once, most recent last', async () => {
-    const r = registry();
-    await r.register(record());
-    await r.touch('session-a', '/repo/a.ts');
-    await r.touch('session-a', '/specs/b.md');
-    await r.touch('session-a', '/repo/a.ts');
-    expect((await r.list())[0]!.touched).toEqual(['/specs/b.md', '/repo/a.ts']);
-  });
-
   it('ignores unreadable records and rejects ids that could escape the folder', async () => {
     const r = registry();
     await r.register(record());
@@ -84,22 +87,27 @@ describe('localReviewHome', () => {
 });
 
 describe('relevantSessions', () => {
-  const s = (id: string, cwd: string, touched: string[] = []) => ({ ...record({ id, cwd }), touched });
+  const s = (id: string, cwd: string, subscriptions: Subscription[] = []): Session => ({
+    ...record({ id, cwd }),
+    subscriptions,
+  });
+  const sub = (topic: Topic): Subscription => ({ topic, reason: 'modified', at: '' });
 
-  it('keeps sessions working in, above or below the folders, or that wrote a file in them', () => {
+  it('keeps sessions started in, above or below the folders, or subscribed to something inside', () => {
     const sessions = [
-      s('inside', '/work/repo/packages/cli'),
-      s('above', '/work'),
-      s('same', '/work/repo'),
-      s('specs-writer', '/elsewhere/code', ['/work/specs/plan.md']),
-      s('unrelated', '/other/project', ['/other/project/a.ts']),
-      s('prefix-only', '/work/repo-other'),
+      s('in', '/repo/worktree-a'),
+      s('above', '/repo'),
+      s('below', '/repo/worktree-a/pkg'),
+      s('elsewhere', '/other'),
+      s('subscribed', '/other', [sub({ kind: 'branch', repo: '/r/.git', branch: 'x', worktree: '/repo/worktree-a' })]),
+      s('spec-writer', '/other', [sub({ kind: 'path', path: '/repo/worktree-a/plan.md' })]),
     ];
-    expect(relevantSessions(sessions, ['/work/repo', '/work/specs']).map((x) => x.id)).toEqual([
-      'inside',
+    expect(relevantSessions(sessions, ['/repo/worktree-a']).map((x) => x.id)).toEqual([
+      'in',
       'above',
-      'same',
-      'specs-writer',
+      'below',
+      'subscribed',
+      'spec-writer',
     ]);
   });
 });
@@ -155,16 +163,91 @@ describe('Session inboxes', () => {
   });
 });
 
-describe('deliveryTarget', () => {
-  const session = (id: string, cwd: string, startedAt: string) => ({ ...record({ id, cwd, startedAt }), touched: [] });
+describe('Subscriptions', () => {
+  const branch = (b: string): Topic => ({ kind: 'branch', repo: '/work/app/.git', branch: b, worktree: `/work/${b}` });
 
-  it('picks the session of that folder that started last', () => {
+  it('subscribes once per topic, unsubscribes, and goes with the session', async () => {
+    const r = registry();
+    await r.register(record());
+    expect(await r.subscribe('session-a', branch('feat'), 'modified')).toBe(true);
+    expect(await r.subscribe('session-a', branch('feat'), 'user')).toBe(false); // already
+    expect(await r.subscribe('session-a', { kind: 'path', path: '/specs/plan.md' }, 'modified')).toBe(true);
+    expect((await r.list())[0]!.subscriptions.map((x) => [topicLabel(x.topic), x.reason])).toEqual([
+      ['app · feat', 'modified'],
+      ['/specs/plan.md', 'modified'],
+    ]);
+    expect((await r.unsubscribe('session-a', branch('feat'))).length).toBe(1);
+    expect((await r.subscriptions('session-a')).map((x) => x.topic.kind)).toEqual(['path']);
+    expect((await r.unsubscribe('session-a', 'all')).length).toBe(1);
+    expect(await r.subscriptions('session-a')).toEqual([]);
+    await r.subscribe('session-a', branch('feat'), 'launch');
+    await r.unregister('session-a');
+    expect(await readdir(r.dir)).toEqual([]);
+  });
+
+  it('publishes to every subscriber of the topic of a file', () => {
+    const at = (id: string, ...subs: Topic[]): Session => ({
+      ...record({ id }),
+      subscriptions: subs.map((topic) => ({ topic, reason: 'modified' as const, at: '' })),
+    });
     const sessions = [
-      session('old', '/repo', '2026-09-26T09:00:00.000Z'),
-      session('new', '/repo/sub', '2026-09-26T11:00:00.000Z'),
-      session('other', '/elsewhere', '2026-09-26T12:00:00.000Z'),
+      at('dev', branch('feat')),
+      at('reviewer', branch('feat')),
+      at('other', branch('main')),
+      at('specs', { kind: 'path', path: '/specs' }),
     ];
-    expect(deliveryTarget(sessions, '/repo')?.id).toBe('new');
-    expect(deliveryTarget(sessions, '/nowhere')).toBeUndefined();
+    const ids = (file: string, topic: Topic) => subscribersOf(sessions, file, topic).map((x) => x.id);
+    expect(ids('/work/feat/a.ts', branch('feat'))).toEqual(['dev', 'reviewer']);
+    expect(ids('/work/main/a.ts', branch('main'))).toEqual(['other']);
+    expect(ids('/specs/plan.md', { kind: 'path', path: '/specs/plan.md' })).toEqual(['specs']);
+    expect(ids('/work/x/a.ts', branch('x'))).toEqual([]);
+  });
+});
+
+describe('Topics', () => {
+  it('are the branch of a git worktree (shared by its worktrees as one repo), else the path', async () => {
+    const { execFileSync } = await import('node:child_process');
+    const { mkdir, realpath, writeFile } = await import('node:fs/promises');
+    const base = await realpath(await mkdtemp(join(tmpdir(), 'lr-topics-')));
+    try {
+      const repo = join(base, 'app');
+      const g = (...args: string[]) =>
+        execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@e', ...args], { cwd: repo });
+      await mkdir(join(repo, 'src'), { recursive: true });
+      g('init', '-q', '-b', 'main');
+      await writeFile(join(repo, 'src', 'a.ts'), 'a');
+      g('add', '.');
+      g('commit', '-qm', 'init');
+      g('worktree', 'add', '-q', '-b', 'feat', join(base, 'wt-feat'));
+
+      const main = await topicOf(join(repo, 'src', 'a.ts'));
+      const feat = await topicOf(join(base, 'wt-feat', 'src', 'new-file.ts')); // not there yet: its folder decides
+      expect(main).toMatchObject({ kind: 'branch', branch: 'main', repo: join(repo, '.git'), worktree: repo });
+      expect(feat).toMatchObject({ kind: 'branch', branch: 'feat', repo: join(repo, '.git') });
+      expect(topicLabel(feat)).toBe('app · feat');
+      expect(await topicOf(join(base, 'notes.md'))).toEqual({ kind: 'path', path: join(base, 'notes.md') });
+      expect(await topicOf(join(repo, 'src'), { asPath: true })).toEqual({ kind: 'path', path: join(repo, 'src') });
+
+      const since = Date.now() - 5000;
+      await writeFile(join(base, 'wt-feat', 'src', 'b.ts'), 'b');
+      expect(await filesChangedSince(join(base, 'wt-feat'), since)).toEqual([join(base, 'wt-feat', 'src', 'b.ts')]);
+      expect(await filesChangedSince(base, since)).toEqual([]); // not git
+    } finally {
+      await rm(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Session notes', () => {
+  it('keeps a note until it is taken, and drops notes with the session', async () => {
+    const r = registry();
+    await r.register(record());
+    await r.setNote('session-a', 'bash-1', '123');
+    expect(await r.takeNote('session-a', 'bash-1')).toBe('123');
+    expect(await r.takeNote('session-a', 'bash-1')).toBeUndefined();
+    await r.setNote('session-a', 'bash-2', '456');
+    await r.unregister('session-a');
+    expect(await readdir(join(home, 'sessions'))).toEqual([]);
+    await expect(r.setNote('session-a', '../x', '1')).rejects.toThrow();
   });
 });

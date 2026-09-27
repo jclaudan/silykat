@@ -6,7 +6,11 @@ import {
   findStoreRoot,
   findStoresBelow,
   localReviewHome,
+  processAncestors,
   SessionRegistry,
+  sessionOfProcess,
+  topicLabel,
+  topicOf,
   Store,
   type AgentThreadView,
   type ThreadStatus,
@@ -19,6 +23,8 @@ export interface Io {
   out(text: string): void;
   err(text: string): void;
   readStdin(): Promise<string>;
+  /** Parent processes of this command, closest first: to find the agent session it runs in. */
+  ancestors?(): Promise<number[]>;
 }
 
 /** Exit codes. `NOT_FOUND` lets an agent tell "this thread is gone" from other errors. */
@@ -30,18 +36,27 @@ const USAGE = `lr — Local Review, for agents
 
 Usage:
   lr status                               How many threads wait for you
-  lr list [--all] [--format md|json]      Threads waiting for you (--all: every unresolved thread)
+  lr list [--all] [--thread <id>]… [--format md|json]
+                                          Threads waiting for you (--all: every unresolved thread;
+                                          --thread: only those threads)
   lr show <thread-id> [--format md|json]  One thread, in full
   lr reply <thread-id> --agent <name> (--body <markdown> | --body-file <path> | --body -)
            [--status addressed|needs-info]
   lr set-status <thread-id> addressed|needs-info --agent <name>
+
+Subscriptions (comments are published to the sessions subscribed to their branch or path):
+  lr subscribe [<dir-or-file>] [--path]   Subscribe this session to the branch of that folder
+                                          (default: the current one), or to the path itself
+                                          (--path, and always outside git)
+  lr unsubscribe [<dir-or-file>] [--path] [--all]
+  lr subscriptions [--format md|json]     What this session is subscribed to
+  (the session is found from the processes running lr; --session <id> or $LR_SESSION to name it)
 
 Sessions (used by agent integrations to register themselves):
   lr sessions [--format md|json]          Running agent sessions on this machine
   lr session register --id <id> --agent <name> --cwd <dir> [--branch <b>] [--pid <n>]
                      [--push yes|no] [--push-command <command>]
   lr session unregister --id <id>
-  lr session touch --id <id> <file>       The session wrote this file
 
 Options:
   --root <dir>    Folder holding .local-review/ (default: found from the current directory)
@@ -68,6 +83,12 @@ export async function runCli(args: string[], io: Io): Promise<number> {
         return await sessions(rest, io);
       case 'session':
         return await session(rest, io);
+      case 'subscribe':
+        return await subscribe(rest, io);
+      case 'unsubscribe':
+        return await unsubscribe(rest, io);
+      case 'subscriptions':
+        return await subscriptions(rest, io);
       case undefined:
       case 'help':
       case '--help':
@@ -88,11 +109,11 @@ export async function runCli(args: string[], io: Io): Promise<number> {
   }
 }
 
-type Values = Record<string, string | boolean | undefined>;
+type Values = Record<string, string | boolean | string[] | undefined>;
 
 function parse(
   rest: string[],
-  options: Record<string, { type: 'string' | 'boolean' }>,
+  options: Record<string, { type: 'string' | 'boolean'; multiple?: boolean }>,
 ): { values: Values; positionals: string[] } {
   try {
     const parsed = parseArgs({ args: rest, options: { root: { type: 'string' }, ...options }, allowPositionals: true });
@@ -102,7 +123,7 @@ function parse(
   }
 }
 
-const str = (v: string | boolean | undefined): string | undefined => (typeof v === 'string' ? v : undefined);
+const str = (v: Values[string]): string | undefined => (typeof v === 'string' ? v : undefined);
 
 function openStore(root: string | undefined, io: Io): Store {
   const dir = root ? resolve(io.cwd, root) : findStoreRoot(io.cwd, io.env);
@@ -145,10 +166,17 @@ async function status(rest: string[], io: Io): Promise<number> {
 }
 
 async function list(rest: string[], io: Io): Promise<number> {
-  const { values } = parse(rest, { all: { type: 'boolean' }, format: { type: 'string' } });
+  const { values } = parse(rest, {
+    all: { type: 'boolean' },
+    thread: { type: 'string', multiple: true },
+    format: { type: 'string' },
+  });
+  const only = Array.isArray(values.thread) ? new Set(values.thread) : undefined;
   const { located } = await visibleThreads(openStore(str(values.root), io));
-  const selected = located.filter((l) =>
-    values.all === true ? l.view.thread.status !== 'resolved' : l.view.needsAgent,
+  const selected = located.filter(
+    (l) =>
+      (only === undefined || only.has(l.view.thread.id)) &&
+      (values.all === true ? l.view.thread.status !== 'resolved' : l.view.needsAgent),
   );
   if (str(values.format) === 'json') {
     io.out(JSON.stringify(selected.map(toJson), null, 2));
@@ -237,7 +265,11 @@ async function sessions(rest: string[], io: Io): Promise<number> {
   }
   io.out(
     list
-      .map((x) => `${x.agent} · ${x.branch ?? 'no branch'} · ${x.cwd} (${x.id})${x.push === false ? ' · no push' : ''}`)
+      .map(
+        (x) =>
+          `${x.agent} ${x.id.slice(0, 8)} · ${x.branch ?? 'no branch'} · ${x.cwd}${x.push === false ? ' · no push' : ''}` +
+          x.subscriptions.map((sub) => `\n  subscribed to ${topicLabel(sub.topic)} (${sub.reason})`).join(''),
+      )
       .join('\n'),
   );
   return EXIT.OK;
@@ -280,15 +312,69 @@ async function session(rest: string[], io: Io): Promise<number> {
       await registry.unregister(id);
       io.out(`Session ${id} unregistered.`);
       return EXIT.OK;
-    case 'touch': {
-      const file = positionals[0];
-      if (!file) throw new UsageError('missing <file>');
-      await registry.touch(id, resolve(io.cwd, file));
-      return EXIT.OK;
-    }
     default:
       throw new UsageError(`unknown session action: ${action ?? '(none)'}`);
   }
+}
+
+const subscriptionOptions = {
+  session: { type: 'string' as const },
+  path: { type: 'boolean' as const },
+  all: { type: 'boolean' as const },
+  format: { type: 'string' as const },
+};
+
+/** The agent session this command runs in. */
+async function currentSession(values: Values, io: Io): Promise<{ registry: SessionRegistry; id: string }> {
+  const registry = registryFor(io);
+  const named = str(values.session) ?? io.env.LR_SESSION?.trim();
+  if (named) return { registry, id: named };
+  const found = sessionOfProcess(await registry.list(), (await io.ancestors?.()) ?? (await processAncestors()));
+  if (!found)
+    throw new Error(
+      'this command does not run in a registered agent session. Pass --session <id> (see lr sessions), or set LR_SESSION.',
+    );
+  return { registry, id: found.id };
+}
+
+async function subscribe(rest: string[], io: Io): Promise<number> {
+  const { values, positionals } = parse(rest, subscriptionOptions);
+  const { registry, id } = await currentSession(values, io);
+  const topic = await topicOf(resolve(io.cwd, positionals[0] ?? '.'), { asPath: values.path === true });
+  const added = await registry.subscribe(id, topic, 'user');
+  io.out(`${added ? 'Subscribed to' : 'Already subscribed to'} ${topicLabel(topic)}.`);
+  return EXIT.OK;
+}
+
+async function unsubscribe(rest: string[], io: Io): Promise<number> {
+  const { values, positionals } = parse(rest, subscriptionOptions);
+  const { registry, id } = await currentSession(values, io);
+  const gone = await registry.unsubscribe(
+    id,
+    values.all === true
+      ? 'all'
+      : await topicOf(resolve(io.cwd, positionals[0] ?? '.'), { asPath: values.path === true }),
+  );
+  io.out(
+    gone.length === 0
+      ? 'Not subscribed to that.'
+      : `Unsubscribed from ${gone.map((g) => topicLabel(g.topic)).join(', ')}.`,
+  );
+  return EXIT.OK;
+}
+
+async function subscriptions(rest: string[], io: Io): Promise<number> {
+  const { values } = parse(rest, subscriptionOptions);
+  const { registry, id } = await currentSession(values, io);
+  const subs = await registry.subscriptions(id);
+  if (str(values.format) === 'json') io.out(JSON.stringify(subs, null, 2));
+  else
+    io.out(
+      subs.length === 0
+        ? 'This session is subscribed to nothing: comments reach it only when the user asks.'
+        : subs.map((sub) => `${topicLabel(sub.topic)} (${sub.reason})`).join('\n'),
+    );
+  return EXIT.OK;
 }
 
 function requireThreadId(positionals: string[]): string {

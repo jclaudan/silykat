@@ -109,6 +109,11 @@ export class ReviewController implements vscode.Disposable {
   readonly onDidPublish = this.published.event;
   private watchers: vscode.Disposable[] = [];
   confirm: ConfirmHandler = modalConfirm;
+  /**
+   * Asked before comments are published (not for drafts), with their files: `false` cancels. Set by
+   * the deliveries, which warn when no agent session is subscribed to them.
+   */
+  publishGate: (root: string, files: string[]) => Promise<boolean> = async () => true;
   choose: ChooseHandler = warningChoice;
   private ctx: RenderContext;
 
@@ -178,6 +183,7 @@ export class ReviewController implements vscode.Disposable {
         return;
       }
       const { root, base } = target;
+      if (!opts.draft && !(await this.publishGate(root.path, [join(root.path, ...base.path.split('/'))]))) return;
       const doc = await vscode.workspace.openTextDocument(thread.uri);
       // No range: a comment on the whole file.
       const anchor: Anchor = thread.range
@@ -208,6 +214,7 @@ export class ReviewController implements vscode.Disposable {
     if (text === '' || !threadId || !managed) return;
 
     try {
+      if (!opts.draft && !(await this.publishGate(managed.root.path, [this.threadFile(threadId)!]))) return;
       const reviewId = opts.draft ? (await this.ensureReview(managed.root)).id : null;
       const state = await managed.root.store.addComment(threadId, { author: 'user', body: text, reviewId });
       this.adopt(managed.root, state, managed.thread);
@@ -839,6 +846,12 @@ export class ReviewController implements vscode.Disposable {
   }
 
   /** Snapshot for tests and diagnostics. */
+  /** Absolute path of a thread's file (the worktree file, also for a thread about a git version). */
+  threadFile(threadId: string): string | undefined {
+    const m = this.managed.get(threadId);
+    return m ? join(m.root.path, ...m.state.anchor.path.split('/')) : undefined;
+  }
+
   listThreads(): {
     id: string;
     /** Canonical URI first, then aliases. */

@@ -29,9 +29,14 @@ describe('Agent sessions of this workspace', () => {
     registry = new SessionRegistry(localReviewHome());
   });
 
-  beforeEach(() => {
+  // Nothing registered or waiting may leak between tests (or into later files: sessions left
+  // behind would make their comments ask which session to use).
+  const clean = () => {
     rmSync(registry.dir, { recursive: true, force: true });
-  });
+    rmSync(join(localReviewHome(), 'queue'), { recursive: true, force: true });
+  };
+  beforeEach(clean);
+  after(clean);
 
   it('uses a private Local Review home in tests', () => {
     assert.ok(process.env.LOCAL_REVIEW_HOME, 'LOCAL_REVIEW_HOME is set by the test config');
@@ -41,10 +46,10 @@ describe('Agent sessions of this workspace', () => {
     assert.equal((await api.refreshSessions()).statusText, undefined);
   });
 
-  it('shows a session started in this workspace, with its branch', async () => {
+  it('shows a session started in this workspace, with its short id', async () => {
     await registry.register(session({}));
     const shown = await api.refreshSessions();
-    assert.equal(shown.statusText, '$(hubot) Claude · feature-x');
+    assert.equal(shown.statusText, '$(hubot) Claude claude-1');
     assert.deepEqual(shown.relevant, ['claude-1']);
   });
 
@@ -58,9 +63,9 @@ describe('Agent sessions of this workspace', () => {
     assert.deepEqual(shown.all.sort(), ['a', 'b', 'elsewhere']);
   });
 
-  it('counts a session working elsewhere that wrote a file here', async () => {
+  it('counts a session working elsewhere that is subscribed to a file here', async () => {
     await registry.register(session({ id: 'specs', cwd: '/some/other/code' }));
-    await registry.touch('specs', join(ws, 'plan.md'));
+    await registry.subscribe('specs', { kind: 'path', path: join(ws, 'plan.md') }, 'modified');
     assert.deepEqual((await api.refreshSessions()).relevant, ['specs']);
   });
 

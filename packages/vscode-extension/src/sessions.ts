@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { localReviewHome, relevantSessions, SessionRegistry, type Session } from '@local-review/core';
+import { sessionLabel, sessionTopics } from './sessionLabel';
 
 const POLL_MS = 2000;
 
@@ -59,10 +60,11 @@ export class SessionsUi implements vscode.Disposable {
       this.statusBar.hide();
       return;
     }
+    const warning = this.relevant.some((s) => s.push === false) ? ' $(warning)' : '';
     this.statusBar.text =
       others.length === 0
-        ? `$(hubot) ${only.agent}${only.branch ? ` · ${only.branch}` : ''}${only.push === false ? ' $(warning)' : ''}`
-        : `$(hubot) ${this.relevant.length} agent sessions${this.relevant.some((s) => s.push === false) ? ' $(warning)' : ''}`;
+        ? `$(hubot) ${sessionLabel(only)}${warning}`
+        : `$(hubot) ${this.relevant.length} agent sessions${warning}`;
     this.statusBar.tooltip = new vscode.MarkdownString(
       ['**Local Review: agent sessions of this workspace**', ...this.relevant.map(describe)].join('\n\n'),
       true,
@@ -82,17 +84,20 @@ export class SessionsUi implements vscode.Disposable {
     const sorted = [...this.all].sort((a, b) => Number(relevant.has(b.id)) - Number(relevant.has(a.id)));
     await vscode.window.showQuickPick(
       sorted.map((s) => ({
-        label: `$(hubot) ${s.agent}${s.branch ? ` · ${s.branch}` : ''}${s.push === false ? ' $(warning)' : ''}`,
-        description: relevant.has(s.id) ? 'this workspace' : undefined,
-        detail: s.cwd,
+        label: `$(hubot) ${sessionLabel(s)}${s.push === false ? ' $(warning)' : ''}`,
+        description: sessionTopics(s),
+        detail: `${s.cwd} · session ${s.id}`,
       })),
-      { title: 'Running agent sessions', placeHolder: 'Sessions registered with Local Review' },
+      {
+        title: 'Running agent sessions',
+        placeHolder: 'Sessions registered with Local Review, and what they are subscribed to',
+      },
     );
   }
 }
 
 function describe(s: Session): string {
-  const line = `${s.agent}${s.branch ? ` · \`${s.branch}\`` : ''} — ${s.cwd}`;
+  const line = `**${sessionLabel(s)}** — subscribed to: ${sessionTopics(s)}`;
   if (s.push !== false) return line;
   const fix = s.pushCommand ? ` Relaunch it with \`${s.pushCommand}\`.` : '';
   return `${line}\n\n$(warning) Can't be notified of your comments: it sees them when you ask it.${fix}`;

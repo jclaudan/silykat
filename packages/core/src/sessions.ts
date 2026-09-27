@@ -1,6 +1,7 @@
 import { appendFile, mkdir, open, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { topicKey, type Topic } from './topics';
 
 /**
  * A running agent session known to Local Review. Written by the agent's adapter (e.g. the Claude
@@ -11,9 +12,9 @@ export interface SessionRecord {
   id: string;
   /** Display name of the agent, e.g. "Claude". */
   agent: string;
-  /** Folder the session works in. */
+  /** Folder the session was started in. */
   cwd: string;
-  /** Git branch of that folder when the session registered, if any. */
+  /** Git branch of that folder, if any. */
   branch: string | null;
   /** Process to watch: when it is gone, so is the session. `null` when unknown. */
   pid: number | null;
@@ -43,11 +44,22 @@ export interface Delivery {
   kind: 'comment' | 'reply' | 'review';
   threadIds: string[];
   reviewId?: string;
+  /** Every session this publication went to (the same threads may go to several). */
+  recipients?: string[];
 }
 
-/** A session, with the files it wrote (absolute paths, most recent last). */
+/** Why a session is subscribed to a topic: for debugging, and to explain it. */
+export type SubscriptionReason = 'launch' | 'modified' | 'user';
+
+export interface Subscription {
+  topic: Topic;
+  reason: SubscriptionReason;
+  at: string;
+}
+
+/** A running session, with what it is subscribed to. */
 export interface Session extends SessionRecord {
-  touched: string[];
+  subscriptions: Subscription[];
 }
 
 /** Local Review's per-machine folder: `$LOCAL_REVIEW_HOME`, or `~/.local-review`. */
@@ -79,7 +91,7 @@ export class SessionRegistry {
     this.dir = join(home, 'sessions');
   }
 
-  private file(id: string, kind: 'json' | 'touched' | 'inbox'): string {
+  private file(id: string, kind: 'json' | 'subscriptions' | 'inbox'): string {
     // Ids come from agents: never let one escape the registry folder.
     if (!SESSION_ID.test(id)) throw new Error(`Invalid session id: ${id}`);
     return join(this.dir, kind === 'json' ? `${id}.json` : `${id}.${kind}.jsonl`);
@@ -94,19 +106,89 @@ export class SessionRegistry {
     await rename(tmp, target);
   }
 
+  /** Everything the registry keeps about a session goes with it. */
   async unregister(id: string): Promise<void> {
-    await rm(this.file(id, 'json'), { force: true });
-    await rm(this.file(id, 'touched'), { force: true });
-    await rm(this.file(id, 'inbox'), { force: true });
+    this.file(id, 'json'); // validates the id
+    let names: string[] = [];
+    try {
+      names = await readdir(this.dir);
+    } catch {
+      return;
+    }
+    await Promise.all(names.filter((n) => n.startsWith(`${id}.`)).map((n) => rm(join(this.dir, n), { force: true })));
   }
 
-  /** Records that a session wrote a file. Appended, so concurrent hooks never lose an entry. */
-  async touch(id: string, absolutePath: string): Promise<void> {
+  /** A small note an adapter keeps about a session between two hooks (removed with the session). */
+  async setNote(id: string, key: string, value: string): Promise<void> {
     await mkdir(this.dir, { recursive: true });
-    await appendFile(
-      this.file(id, 'touched'),
-      JSON.stringify({ path: absolutePath, at: new Date().toISOString() }) + '\n',
-    );
+    await writeFile(this.note(id, key), value);
+  }
+
+  /** Reads and removes a note; `undefined` when there is none. */
+  async takeNote(id: string, key: string): Promise<string | undefined> {
+    const file = this.note(id, key);
+    try {
+      const value = await readFile(file, 'utf8');
+      await rm(file, { force: true });
+      return value;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private note(id: string, key: string): string {
+    if (!SESSION_ID.test(key)) throw new Error(`Invalid note key: ${key}`);
+    this.file(id, 'json'); // validates the id
+    return join(this.dir, `${id}.note-${key}`);
+  }
+
+  /**
+   * Subscribes a session to a topic. Resolves to `true` when it was not subscribed yet (e.g. to tell
+   * the agent). Appended, so concurrent hooks never lose an entry.
+   */
+  async subscribe(id: string, topic: Topic, reason: SubscriptionReason): Promise<boolean> {
+    const already = (await this.subscriptions(id)).some((s) => topicKey(s.topic) === topicKey(topic));
+    if (already) return false;
+    await this.appendSubscription(id, { op: 'add', topic, reason, at: new Date().toISOString() });
+    return true;
+  }
+
+  /** Unsubscribes a session from a topic, or from everything. Resolves to what it was subscribed to. */
+  async unsubscribe(id: string, topic: Topic | 'all'): Promise<Subscription[]> {
+    const current = await this.subscriptions(id);
+    const gone = topic === 'all' ? current : current.filter((s) => topicKey(s.topic) === topicKey(topic));
+    for (const s of gone)
+      await this.appendSubscription(id, { op: 'remove', topic: s.topic, at: new Date().toISOString() });
+    return gone;
+  }
+
+  /** What a session is subscribed to, oldest first. */
+  async subscriptions(id: string): Promise<Subscription[]> {
+    let text: string;
+    try {
+      text = await readFile(this.file(id, 'subscriptions'), 'utf8');
+    } catch {
+      return [];
+    }
+    const current = new Map<string, Subscription>();
+    for (const line of text.split('\n')) {
+      try {
+        const e = JSON.parse(line) as { op?: unknown; topic?: Topic; reason?: SubscriptionReason; at?: string };
+        if (!e.topic || (e.topic.kind !== 'branch' && e.topic.kind !== 'path')) continue;
+        const key = topicKey(e.topic);
+        if (e.op === 'remove') current.delete(key);
+        else if (e.op === 'add' && !current.has(key))
+          current.set(key, { topic: e.topic, reason: e.reason ?? 'user', at: e.at ?? '' });
+      } catch {
+        // an interrupted or corrupt line: skip it
+      }
+    }
+    return [...current.values()];
+  }
+
+  private async appendSubscription(id: string, event: object): Promise<void> {
+    await mkdir(this.dir, { recursive: true });
+    await appendFile(this.file(id, 'subscriptions'), JSON.stringify(event) + '\n');
   }
 
   /** Hands threads to a session. Appended to its inbox, which its agent's adapter watches. */
@@ -162,34 +244,9 @@ export class SessionRegistry {
         await this.unregister(record.id).catch(() => undefined);
         continue;
       }
-      sessions.push({ ...record, touched: await this.readTouched(record.id) });
+      sessions.push({ ...record, subscriptions: await this.subscriptions(record.id) });
     }
     return sessions;
-  }
-
-  private async readTouched(id: string): Promise<string[]> {
-    let text: string;
-    try {
-      text = await readFile(this.file(id, 'touched'), 'utf8');
-    } catch {
-      return [];
-    }
-    const paths: string[] = [];
-    for (const line of text.split('\n')) {
-      try {
-        const { path } = JSON.parse(line) as { path?: unknown };
-        if (typeof path === 'string') paths.push(path);
-      } catch {
-        // an interrupted or corrupt line: skip it
-      }
-    }
-    // Each file once, ordered by its most recent write (most recent last).
-    const order = new Map<string, true>();
-    for (const p of paths) {
-      order.delete(p);
-      order.set(p, true);
-    }
-    return [...order.keys()];
   }
 }
 
@@ -225,8 +282,42 @@ function parseDelivery(line: string): Delivery | null {
       kind,
       threadIds: raw.threadIds.filter((t): t is string => typeof t === 'string'),
       ...(typeof raw.reviewId === 'string' ? { reviewId: raw.reviewId } : {}),
+      ...(Array.isArray(raw.recipients)
+        ? { recipients: raw.recipients.filter((r): r is string => typeof r === 'string') }
+        : {}),
     };
   } catch {
     return null; // corrupt line: skip it
   }
+}
+
+/** The parent processes of `pid`, closest first (via `ps`; empty where it is not available). */
+export async function processAncestors(pid: number = process.ppid, max = 12): Promise<number[]> {
+  const { execFile } = await import('node:child_process');
+  const parentOf = (p: number) =>
+    new Promise<number | null>((done) =>
+      execFile('ps', ['-o', 'ppid=', '-p', String(p)], { timeout: 2000 }, (err, out) => {
+        const n = Number(out.trim());
+        done(err || !Number.isInteger(n) ? null : n);
+      }),
+    );
+  const chain = [pid];
+  for (let p: number | null = pid; chain.length < max;) {
+    p = await parentOf(p);
+    if (p === null || p <= 1) break;
+    chain.push(p);
+  }
+  return chain;
+}
+
+/**
+ * The session a command runs in: the registered session whose process is one of its ancestors
+ * (an agent runs `lr` through its shell).
+ */
+export function sessionOfProcess(sessions: readonly Session[], ancestors: readonly number[]): Session | undefined {
+  for (const pid of ancestors) {
+    const found = sessions.filter((s) => s.pid === pid);
+    if (found.length > 0) return found.reduce((a, s) => (s.startedAt > a.startedAt ? s : a));
+  }
+  return undefined;
 }

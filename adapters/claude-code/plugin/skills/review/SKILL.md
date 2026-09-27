@@ -10,7 +10,7 @@ The user reviews your code in VS Code and leaves comments in threads, like on a 
 
 ## 1. See what is waiting
 
-**Started by a Local Review channel message** (`<channel source="…local-review…" store="<folder>">`): the user just published comments in that folder, and expects you to handle them without being asked. Add `--root <folder>` to every `lr` command below. When you were busy with another task, finish or pause it at a sensible point first, then handle the comments, then go back to it.
+**Started by a Local Review channel message** (`<channel source="…local-review…" store="<folder>" threads="<ids>">`): the user just published comments in that folder, and expects you to handle them without being asked. Add `--root <folder>` to every `lr` command below, and list only the threads of the message (`lr list --root <folder> --thread <id> --thread <id>…`): the other threads waiting in that folder may be for another session. When you were busy with another task, finish or pause it at a sensible point first, then handle the comments, then go back to it.
 
 Run `lr status`. If no thread waits for you, tell the user and stop.
 
@@ -50,6 +50,16 @@ Always pass the body on stdin with `--body -` and a quoted heredoc as above, so 
 - A thread where you already asked a question and the user has not answered yet is not listed: leave it alone.
 - You never resolve threads: only the user does.
 
-## 4. Finish
+## 4. Subscriptions: which comments come to you
+
+Local Review publishes each comment to the sessions **subscribed** to its branch (or, outside git, its file or folder). This session is subscribed automatically when it was started in a git worktree, and when it modifies a file (you are then told so: pass it on to the user). The user may also ask you:
+
+- "subscribe to this branch / this repo / this folder" → `lr subscribe [<folder or file>]` (`--path` for a folder or file rather than its branch);
+- "unsubscribe" → `lr unsubscribe [<folder or file>]`, or `lr unsubscribe --all`;
+- "what are you subscribed to?" → `lr subscriptions`.
+
+Whenever a subscription changes, say so in your reply, in one short sentence. Being subscribed does not mean doing everything: a comment may also go to other sessions (e.g. a reviewer); do what fits your role in this session.
+
+## 5. Finish
 
 Run `lr status` to check that nothing is left, then give the user a short summary: threads addressed, questions asked, files changed.

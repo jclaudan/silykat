@@ -1,31 +1,25 @@
-import { isAbsolute, relative } from 'node:path';
 import type { Session } from './sessions';
+import { isWithin, topicCovers, type Topic } from './topics';
 
-/** Whether `inner` is `outer` itself or inside it. */
-export function isWithin(inner: string, outer: string): boolean {
-  const rel = relative(outer, inner);
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
-}
+export { isWithin };
 
 /**
- * Sessions that matter to some folders: working in, above or below one of them, or having written
- * a file inside one (e.g. specs kept in a separate folder).
+ * Sessions that matter to some folders: started in, above or below one of them, or subscribed to
+ * something inside one.
  */
 export function relevantSessions(sessions: readonly Session[], folders: readonly string[]): Session[] {
+  const inside = (p: string | undefined) => p !== undefined && folders.some((f) => isWithin(p, f));
   return sessions.filter(
     (s) =>
       folders.some((f) => isWithin(s.cwd, f) || isWithin(f, s.cwd)) ||
-      s.touched.some((file) => folders.some((f) => isWithin(file, f))),
+      s.subscriptions.some((sub) => inside(sub.topic.kind === 'branch' ? sub.topic.worktree : sub.topic.path)),
   );
 }
 
 /**
- * The session that should process threads published in the store at `root`: among the sessions
- * that matter to it, the one that started last. `undefined` when no session matters to it.
+ * The sessions a comment on `file` (whose own topic is `topic`) is published to: every session
+ * subscribed to that topic. Local Review publishes; what each session does with it is up to it.
  */
-export function deliveryTarget(sessions: readonly Session[], root: string): Session | undefined {
-  return relevantSessions(sessions, [root]).reduce<Session | undefined>(
-    (best, s) => (best === undefined || s.startedAt > best.startedAt ? s : best),
-    undefined,
-  );
+export function subscribersOf(sessions: readonly Session[], file: string, topic: Topic): Session[] {
+  return sessions.filter((s) => s.subscriptions.some((sub) => topicCovers(sub.topic, topic, file)));
 }

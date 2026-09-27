@@ -70,6 +70,8 @@ An alias saves typing it, e.g. in `~/.zshrc`: `alias claude-lr='claude --dangero
 
 This works with Claude Code in a terminal (the `claude` command line). The Claude Code panel of VS Code cannot be launched with a channel yet: there, ask Claude with `/local-review:review` when you have published.
 
+**Comments go to the sessions subscribed to them.** Local Review publishes each comment to the agent sessions **subscribed** to its git branch (or, outside git, to its file or folder), and to all of them: e.g. a developer session and a reviewer session. A session subscribes by itself when it is started in a git worktree, and when it modifies a file (with its editing tools or a shell command: the branch of that file); Claude then tells you. You can also ask it: "subscribe to this branch", "unsubscribe", "what are you subscribed to?" (`/local-review:subscribe`, `/local-review:unsubscribe`). Reading files or moving to a folder does not subscribe. VS Code shows each session with its short id and what it is subscribed to. When nobody is subscribed to what you publish, VS Code warns you: cancel, or publish anyway (the comments are saved, and an agent reads them when you ask it), optionally without being warned again for that folder until VS Code closes.
+
 A session launched without the channel still receives the comments, but only sees them when you ask it (`/local-review:review`). VS Code tells you so once, with the command to relaunch it, and marks the session with a warning sign in the status bar. Deliveries go to each session's inbox, next to its registry entry.
 
 `lr` on its own:
@@ -79,6 +81,8 @@ lr status                                    # how many threads wait for the age
 lr list                                      # those threads, with their current code
 lr reply <thread-id> --agent Claude --status addressed --body -   # body on stdin
 lr set-status <thread-id> needs-info --agent Claude
+lr subscribe [<folder>] [--path]             # subscribe the session lr runs in (found from its processes)
+lr subscriptions                             # what it is subscribed to
 ```
 
 ## Architecture
