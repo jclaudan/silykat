@@ -25,6 +25,9 @@ export type NoSubscriberPrompt = (
 ) => Thenable<string | undefined>;
 
 const COPY = 'Copy Command';
+
+/** `localReview.pushToAgents`: whether published comments are sent to the agent sessions at all. */
+const pushEnabled = () => vscode.workspace.getConfiguration('localReview').get<boolean>('pushToAgents', true);
 const PUBLISH = 'Publish';
 const PUBLISH_AND_MUTE = "Publish, Don't Warn Again for This Folder";
 
@@ -37,6 +40,7 @@ const PUBLISH_AND_MUTE = "Publish, Don't Warn Again for This Folder";
 export class DeliveriesUi implements vscode.Disposable {
   private readonly registry = new SessionRegistry(localReviewHome());
   private readonly subscription: vscode.Disposable;
+  private queue: Promise<void> = Promise.resolve();
   /** Sessions already said not to be notifiable: once each, not at every comment. */
   private readonly warned = new Set<string>();
   /** Folders where the user asked not to be warned again about comments nobody gets (until VS Code closes). */
@@ -49,7 +53,10 @@ export class DeliveriesUi implements vscode.Disposable {
     private readonly review: ReviewController,
     private readonly log: Log,
   ) {
-    this.subscription = review.onDidPublish((p) => void this.deliver(p));
+    // One after the other, in the order of the user's actions (e.g. a comment, then its deletion).
+    this.subscription = review.onDidPublish((p) => {
+      this.queue = this.queue.then(() => this.deliver(p)).then(() => undefined);
+    });
     review.publishGate = (root, files) => this.confirmPublish(root, files);
   }
 
@@ -58,7 +65,7 @@ export class DeliveriesUi implements vscode.Disposable {
    * user cancel. Resolves to whether to publish.
    */
   async confirmPublish(root: string, files: string[]): Promise<boolean> {
-    if (this.muted.has(root) || files.length === 0) return true;
+    if (!pushEnabled() || this.muted.has(root) || files.length === 0) return true;
     try {
       const sessions = await this.registry.list();
       const orphans: Topic[] = [];
@@ -86,11 +93,12 @@ export class DeliveriesUi implements vscode.Disposable {
 
   /** Delivers a publication to every subscribed session. Resolves to their ids. */
   async deliver(p: Publication): Promise<string[]> {
+    if (!pushEnabled()) return []; // the user asks the agents themselves
     try {
       const sessions = await this.registry.list();
       const bySession = new Map<string, { session: Session; threadIds: string[] }>();
       for (const threadId of p.threadIds) {
-        const file = this.review.threadFile(threadId);
+        const file = this.review.threadFile(threadId) ?? p.files?.[threadId];
         if (!file) continue; // deleted meanwhile
         for (const session of subscribersOf(sessions, file, await topicOf(file))) {
           const entry = bySession.get(session.id) ?? { session, threadIds: [] };
