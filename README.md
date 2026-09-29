@@ -44,7 +44,7 @@ Local Review is agent-agnostic by design; **Claude Code** is the first supported
 ## Requirements
 
 - **VS Code** 1.100 or later (or an editor based on it: see [Other editors based on VS Code](#other-editors-based-on-vs-code-cursor-vscodium-windsurf)).
-- **Node.js** 20 or later, **npm** and **git**, to build the extension (it is not on the Marketplace yet).
+- **Node.js** 22.12 or later, with **npm** 11.10 or later, and **git**, to build the extension (it is not on the Marketplace yet).
 - For the agent integration: **Claude Code** in a terminal, logged in with a claude.ai account (Pro or Max) or a Console API key. Team and Enterprise organizations must enable channels (see [Known limitations](#known-limitations)).
 
 ## Installation
