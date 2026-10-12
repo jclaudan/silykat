@@ -1,10 +1,14 @@
 import * as vscode from 'vscode';
 import { AgentRepliesUi, type Notifier } from './agentReplies';
+import { ArchiveUi } from './archive';
+import { HistoryUi, type ErasePrompt } from './history';
+import { RetroSessionsSetting } from './retroSessions';
 import { ReviewController, type ChooseHandler, type ConfirmHandler } from './controller';
 import { simulateAgentReply, type SimulateArgs } from './dev/simulateAgentReply';
 import { DeliveriesUi, type NoSubscriberPrompt, type Warner } from './deliveries';
 import { createLog } from './log';
 import type { LrComment } from './render';
+import { RetroReminderUi, type ReminderPrompt } from './retroReminder';
 import { ReviewUi, type SummaryPrompt } from './review';
 import { SessionsUi } from './sessions';
 
@@ -39,8 +43,24 @@ export interface LocalReviewApi {
   reviewContext(): { active: boolean; here: boolean };
   /** Tests only: threads kept for branches that are not checked out. */
   hiddenThreads(): string[];
+  /** Tests only: warn about a git worktree with comments, as when its folder is opened. */
+  warnIfWorktree(path: string): Promise<void>;
+  /** Tests only: forget which worktrees were warned about. */
+  forgetWorktreeWarnings(): Promise<void>;
   /** Tests only: answer "publish without subscribers?" without showing it. */
   setNoSubscriberPrompt(prompt: NoSubscriberPrompt | undefined): void;
+  /** Tests only: measure the retro cadence now; the retro status bar text, `undefined` when hidden. */
+  refreshRetroReminder(): Promise<{ statusText: string | undefined; due: string[] }>;
+  /** Tests only: answer the retro reminder message without showing it. */
+  setRetroReminderPrompt(prompt: ReminderPrompt | undefined): void;
+  /** Tests only: answer the prompts of the archive and clean-up commands (`undefined`: the real ones). */
+  setArchivePrompts(
+    prompts: Partial<Pick<ArchiveUi, 'askDate' | 'pickThreads' | 'askSaveLocation' | 'inform'>> | undefined,
+  ): void;
+  /** Tests only: answer the offer to erase the history kept (`undefined`: the real one). */
+  setErasePrompt(prompt: ErasePrompt | undefined): void;
+  /** Tests only: the last offer to erase the history kept, once answered (how many threads were erased). */
+  lastEraseOffer(): Promise<number | undefined>;
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<LocalReviewApi> {
@@ -50,7 +70,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<LocalR
   const agentReplies = new AgentRepliesUi(review);
   const sessions = new SessionsUi();
   const deliveries = new DeliveriesUi(review, log);
-  context.subscriptions.push(log, review, reviewUi, agentReplies, sessions, deliveries);
+  const retroReminder = new RetroReminderUi(review.onDidChange);
+  const archive = new ArchiveUi(review, log);
+  const history = new HistoryUi(() => review.rootPaths(), log);
+  const retroSessions = new RetroSessionsSetting(log);
+  context.subscriptions.push(
+    log,
+    review,
+    reviewUi,
+    agentReplies,
+    sessions,
+    deliveries,
+    retroReminder,
+    archive,
+    history,
+    retroSessions,
+  );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('localReview.commentSelection', () =>
@@ -88,6 +123,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<LocalR
     vscode.commands.registerCommand('localReview.cancelNewThread', (reply: vscode.CommentReply) =>
       review.cancelNewThread(reply),
     ),
+    vscode.commands.registerCommand('localReview.saveWorktreeThreads', (target?: vscode.Uri) =>
+      review.saveWorktreeThreads(target instanceof vscode.Uri ? target : undefined),
+    ),
     vscode.commands.registerCommand('localReview.dev.simulateAgentReply', (args?: SimulateArgs) =>
       simulateAgentReply(review, context.extensionUri, args),
     ),
@@ -99,12 +137,21 @@ export async function activate(context: vscode.ExtensionContext): Promise<LocalR
     }),
   );
 
+  review.worktreeWarnings = rememberedSet(context.globalState, 'localReview.warnedWorktrees');
   const defaultConfirm = review.confirm;
   const defaultChoose = review.choose;
   const defaultSummaryPrompt = reviewUi.promptSummary;
   const defaultNotifier = agentReplies.notify;
   const defaultWarner = deliveries.warn;
   const defaultNoSubscriberPrompt = deliveries.askNoSubscriber;
+  const defaultRetroPrompt = retroReminder.prompt;
+  const defaultErasePrompt = history.prompt;
+  const archivePrompts = {
+    askDate: archive.askDate,
+    pickThreads: archive.pickThreads,
+    askSaveLocation: archive.askSaveLocation,
+    inform: archive.inform,
+  };
   await review.reload();
   log.info('Local Review activated');
 
@@ -138,6 +185,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<LocalR
     setNoSubscriberPrompt: (prompt) => {
       deliveries.askNoSubscriber = prompt ?? defaultNoSubscriberPrompt;
     },
+    refreshRetroReminder: async () => {
+      await retroReminder.refresh();
+      return {
+        statusText: retroReminder.statusText,
+        due: retroReminder.cadences.filter((c) => c.due).map((c) => c.root),
+      };
+    },
+    setRetroReminderPrompt: (prompt) => {
+      retroReminder.prompt = prompt ?? defaultRetroPrompt;
+    },
+    setArchivePrompts: (prompts) => {
+      Object.assign(archive, archivePrompts, prompts ?? {});
+    },
+    setErasePrompt: (prompt) => {
+      history.prompt = prompt ?? defaultErasePrompt;
+    },
+    lastEraseOffer: () => history.offered,
+    warnIfWorktree: (path) => review.warnIfWorktree(path),
+    forgetWorktreeWarnings: () => Promise.resolve(context.globalState.update('localReview.warnedWorktrees', undefined)),
     shownSessions: () => sessions.sessions.relevant.map((s) => s.id),
     refreshSessions: async () => {
       await sessions.refresh();
@@ -147,6 +213,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<LocalR
         relevant: sessions.sessions.relevant.map((s) => s.id),
       };
     },
+  };
+}
+
+/** A set of strings kept in the extension's state, across restarts. */
+function rememberedSet(state: vscode.Memento, key: string): { has(v: string): boolean; add(v: string): void } {
+  const all = () => state.get<string[]>(key) ?? [];
+  return {
+    has: (v) => all().includes(v),
+    add: (v) => void state.update(key, [...all().filter((x) => x !== v), v]),
   };
 }
 

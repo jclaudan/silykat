@@ -1,13 +1,32 @@
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
-import { parseArgs } from 'node:util';
 import {
   agentView,
+  callFor,
+  CONFIG_KEYS,
+  PROJECT_CONFIG_KEYS,
+  prepareStoreHome,
+  projectConfigFile,
+  readProjectConfig,
+  retroHome,
+  writeProjectConfig,
+  validSettingNumber,
+  type ConfigSetting,
+  type MachineConfig,
+  configFile,
   findStoreRoot,
   findStoresBelow,
+  historyJson,
+  historyPlan,
+  historySummary,
   localReviewHome,
+  parseDateArg,
   processAncestors,
+  projectHistory,
+  readConfig,
+  saveWorktreeThreads,
   storeAt,
+  writeConfig,
   SessionRegistry,
   sessionOfProcess,
   branchKey,
@@ -16,10 +35,16 @@ import {
   topicLabel,
   topicOf,
   Store,
+  type AgentSessionRef,
   type AgentThreadView,
+  type ThreadState,
   type ThreadStatus,
 } from '@local-review/core';
 import { locate, renderReviews, renderThread, type Located } from './digest';
+import { parse, str, UsageError, type Values } from './args';
+import { renderHistory } from './history';
+import { archive, ARCHIVE_USAGE, purge, unarchive } from './archive';
+import { retro, RETRO_USAGE } from './retro';
 
 export interface Io {
   cwd: string;
@@ -37,8 +62,6 @@ export interface Io {
  */
 export const EXIT = { OK: 0, ERROR: 1, NOT_FOUND: 2, CHANGED: 3 } as const;
 
-class UsageError extends Error {}
-
 /** The user changed the thread since the agent read it: its reply would answer an old request. */
 class ChangedError extends Error {}
 
@@ -52,10 +75,44 @@ Usage:
                                           the threads of what it is subscribed to (--any-topic: all)
   lr show <thread-id> [--format md|json]  One thread, in full
   lr reply <thread-id> --agent <name> (--body <markdown> | --body-file <path> | --body -)
-           [--status addressed|needs-info] [--rev <version>]
+           [--status addressed|needs-info] [--rev <version>] [--session <id>] [--message <id>]
+           The reply records your session (found from the processes running lr, or --session,
+           or $LR_SESSION) and, when known, your message (--message): a retro can then read
+           your conversation back
   lr set-status <thread-id> addressed|needs-info --agent <name> [--rev <version>]
            --rev: the version you read (lr list / lr show): refused, exit 3, if the user changed
            the thread since. Exit 2: the thread no longer exists (e.g. deleted by the user).
+
+History (every thread, whatever its state: open, addressed, resolved, deleted, archived or not):
+  lr history [--since <date>] [--format md|json] [--out <file>]
+                                          The whole conversation of every thread of the project:
+                                          the folder (--root, default: the current one), its
+                                          subfolders, and the git worktrees of its repositories,
+                                          even outside it. --since: threads active since a date
+                                          (2026-10-01, local midnight; an ISO time; or 7d for
+                                          7 days ago). md starts with counts per state and store.
+                                          --out: write it to a file (an export, with --format json)
+
+${ARCHIVE_USAGE}
+
+${RETRO_USAGE}
+
+Git worktrees (git worktree remove deletes a worktree's comments with it):
+  lr worktree save [<dir>] [--format md|json]
+                                          Save the threads of the git worktree of that folder
+                                          (default: the current one) to the store of its main
+                                          worktree, before removing it: they stay in lr history
+                                          and in retros. Saving again refreshes the copy
+
+Settings of this machine:
+  lr config [--format md|json]            Show them
+  lr config set <name> <value>            Change one:
+${Object.entries(CONFIG_KEYS)
+  .map(([name, c]) => `                                            ${name}: ${c.help}`)
+  .join('\n')}
+  lr config [set <name> <value>] --project [--root <dir>]
+                                          The project's own settings (its .local-review/config.json,
+                                          personal), which come before the machine's: ${PROJECT_CONFIG_KEYS.join(', ')}
 
 Subscriptions (comments are published to the sessions subscribed to their branch or path):
   lr subscribe [<dir-or-file>] [--path]   Subscribe this session to the branch of that folder
@@ -93,6 +150,20 @@ export async function runCli(args: string[], io: Io): Promise<number> {
         return await reply(rest, io);
       case 'set-status':
         return await setStatus(rest, io);
+      case 'history':
+        return await history(rest, io);
+      case 'archive':
+        return await archive(rest, io, parseDateOption);
+      case 'unarchive':
+        return await unarchive(rest, io);
+      case 'purge':
+        return await purge(rest, io, parseDateOption);
+      case 'retro':
+        return await retro(rest, io, parseSince);
+      case 'worktree':
+        return await worktree(rest, io);
+      case 'config':
+        return await config(rest, io);
       case 'sessions':
         return await sessions(rest, io);
       case 'session':
@@ -126,22 +197,6 @@ export async function runCli(args: string[], io: Io): Promise<number> {
     return /not found/i.test(message) ? EXIT.NOT_FOUND : EXIT.ERROR;
   }
 }
-
-type Values = Record<string, string | boolean | string[] | undefined>;
-
-function parse(
-  rest: string[],
-  options: Record<string, { type: 'string' | 'boolean'; multiple?: boolean }>,
-): { values: Values; positionals: string[] } {
-  try {
-    const parsed = parseArgs({ args: rest, options: { root: { type: 'string' }, ...options }, allowPositionals: true });
-    return { values: parsed.values as Values, positionals: parsed.positionals };
-  } catch (err) {
-    throw new UsageError(err instanceof Error ? err.message : String(err));
-  }
-}
-
-const str = (v: Values[string]): string | undefined => (typeof v === 'string' ? v : undefined);
 
 function openStore(root: string | undefined, io: Io): Store {
   const dir = root ? resolve(io.cwd, root) : findStoreRoot(io.cwd, io.env);
@@ -266,7 +321,7 @@ async function show(rest: string[], io: Io): Promise<number> {
   const id = requireThreadId(positionals);
   const { located } = await visibleThreads(openStore(str(values.root), io));
   const found = located.find((l) => l.view.thread.id === id);
-  if (!found) throw new Error(await whyNotFound(openStore(str(values.root), io), id));
+  if (!found) throw new Error(await whyNotFound(openStore(str(values.root), io), id, io.env));
   io.out(str(values.format) === 'json' ? JSON.stringify(toJson(found), null, 2) : renderThread(found));
   return EXIT.OK;
 }
@@ -278,6 +333,8 @@ async function reply(rest: string[], io: Io): Promise<number> {
     'body-file': { type: 'string' },
     status: { type: 'string' },
     rev: { type: 'string' },
+    session: { type: 'string' },
+    message: { type: 'string' },
   });
   const id = requireThreadId(positionals);
   const agent = requireAgent(str(values.agent), io);
@@ -289,10 +346,34 @@ async function reply(rest: string[], io: Io): Promise<number> {
   if (body === undefined || body.trim() === '') throw new UsageError('reply needs --body, --body-file or --body -');
 
   const store = openStore(str(values.root), io);
-  await assertCurrent(store, id, str(values.rev));
-  const state = await store.addComment(id, { author: 'agent', agent, body, reviewId: null }, status ? { status } : {});
+  await assertCurrent(store, id, str(values.rev), io.env);
+  const session = await replySession(id, values, io);
+  const state = await store.addComment(
+    id,
+    { author: 'agent', agent, body, reviewId: null, ...(session ? { session } : {}) },
+    status ? { status } : {},
+  );
   io.out(`Replied on ${state.id} (status: ${state.status}).`);
   return EXIT.OK;
+}
+
+/**
+ * The agent's conversation a reply is written in, for retros: the session (named, or the registered
+ * session this command runs in) and, when its adapter noted it, the message running `lr reply`. A
+ * best effort: a reply never fails for want of it.
+ */
+async function replySession(threadId: string, values: Values, io: Io): Promise<AgentSessionRef | undefined> {
+  try {
+    const registry = registryFor(io);
+    const named = str(values.session)?.trim() || io.env.LR_SESSION?.trim();
+    const id =
+      named || sessionOfProcess(await registry.list(), (await io.ancestors?.()) ?? (await processAncestors()))?.id;
+    if (!id) return undefined;
+    const message = str(values.message)?.trim() || callFor(await registry.calls(id).catch(() => []), threadId)?.message;
+    return message ? { id, message } : { id };
+  } catch {
+    return undefined;
+  }
 }
 
 async function setStatus(rest: string[], io: Io): Promise<number> {
@@ -300,10 +381,161 @@ async function setStatus(rest: string[], io: Io): Promise<number> {
   const id = requireThreadId(positionals);
   const status = agentStatus(positionals[1]);
   const store = openStore(str(values.root), io);
-  await assertCurrent(store, id, str(values.rev));
+  await assertCurrent(store, id, str(values.rev), io.env);
   const state = await store.setStatus(id, status, 'agent', requireAgent(str(values.agent), io));
   io.out(`${state.id} is now ${state.status}.`);
   return EXIT.OK;
+}
+
+async function history(rest: string[], io: Io): Promise<number> {
+  const { values, positionals } = parse(rest, {
+    since: { type: 'string' },
+    format: { type: 'string' },
+    out: { type: 'string' },
+  });
+  if (positionals.length > 0) throw new UsageError(`lr history takes no argument: "${positionals[0]}"`);
+  const format = str(values.format) ?? 'md';
+  if (format !== 'md' && format !== 'json') throw new UsageError(`--format must be "md" or "json", not "${format}"`);
+  const since = parseSince(str(values.since));
+  const h = await projectHistory(resolve(io.cwd, str(values.root) ?? '.'), { since, env: io.env });
+  const text = format === 'json' ? JSON.stringify(historyJson(h), null, 2) : renderHistory(h);
+  const out = str(values.out);
+  if (out === undefined) io.out(text);
+  else {
+    const file = resolve(io.cwd, out);
+    await writeFile(file, text + '\n');
+    io.out(`Wrote the history of ${h.threads} thread${h.threads === 1 ? '' : 's'} (${format}) to ${file}.`);
+  }
+  return EXIT.OK;
+}
+
+async function worktree(rest: string[], io: Io): Promise<number> {
+  const { values, positionals } = parse(rest, { format: { type: 'string' } });
+  const [action, dir, extra] = positionals;
+  if (action !== 'save') throw new UsageError(`lr worktree takes "save", not "${action ?? ''}"`);
+  if (extra !== undefined) throw new UsageError(`lr worktree save takes one folder at most: "${extra}"`);
+  const result = await saveWorktreeThreads(resolve(io.cwd, dir ?? str(values.root) ?? '.'), io.env);
+  if (str(values.format) === 'json') {
+    io.out(JSON.stringify(result, null, 2));
+    return EXIT.OK;
+  }
+  const branch = result.branch ? ` (branch ${result.branch})` : '';
+  io.out(
+    result.copies.length === 0
+      ? `No comment in the worktree ${result.worktree}${branch}: nothing to save.`
+      : `Saved ${result.published} thread${result.published === 1 ? '' : 's'} of the worktree ${result.worktree}${branch} ` +
+          `to the store of ${result.main}:\n${result.copies.map((c) => `  ${c.from} → ${c.dir}`).join('\n')}\n` +
+          'They stay in lr history and in retros after the worktree is removed.',
+  );
+  return EXIT.OK;
+}
+
+/** After `keep-history off`: the history already kept here, and how to erase it. */
+async function keptHistoryNote(io: Io): Promise<string> {
+  let summary: string | null = null;
+  try {
+    const plan = await historyPlan([io.cwd], io.env);
+    summary = historySummary(plan.deleted.length, plan.saved.length);
+  } catch {
+    // The setting is changed: an unreadable folder only leaves out the count.
+  }
+  return (
+    ' Deleting a thread now erases it, and nothing is saved when an agent removes a worktree.' +
+    (summary
+      ? `\nThe history already kept stays: ${summary} in ${io.cwd}. To erase it: lr purge --history (it shows what, then --yes).`
+      : '')
+  );
+}
+
+async function config(rest: string[], io: Io): Promise<number> {
+  const { values, positionals } = parse(rest, { format: { type: 'string' }, project: { type: 'boolean' } });
+  const [action, name, value] = positionals;
+  if (values.project === true) return projectConfig(io, str(values.root), action, name, value, str(values.format));
+  if (action === 'set') {
+    const setting = name ? CONFIG_KEYS[name] : undefined;
+    if (!setting) throw new UsageError(`unknown setting "${name ?? ''}": ${Object.keys(CONFIG_KEYS).join(', ')}`);
+    if (setting.kind === 'boolean') {
+      if (value !== 'on' && value !== 'off') throw new UsageError(`${name} takes "on" or "off", not "${value ?? ''}"`);
+      await writeConfig({ [setting.key]: value === 'on' }, io.env);
+    } else if (setting.kind === 'choice') {
+      if (!setting.choices.includes(value ?? ''))
+        throw new UsageError(`${name} takes ${setting.choices.join(' or ')}, not "${value ?? ''}"`);
+      await writeConfig({ [setting.key]: value as MachineConfig[typeof setting.key] }, io.env);
+    } else {
+      const n = /^\d+$/.test(value ?? '') ? Number(value) : NaN;
+      if (!validSettingNumber(n)) throw new UsageError(`${name} takes a whole number, 1 or more, not "${value ?? ''}"`);
+      await writeConfig({ [setting.key]: n }, io.env);
+    }
+    io.out(`${name} is now ${value}.` + (name === 'keep-history' && value === 'off' ? await keptHistoryNote(io) : ''));
+    return EXIT.OK;
+  }
+  if (action !== undefined) throw new UsageError(`lr config takes "set" or nothing, not "${action}"`);
+  const current = await readConfig(io.env);
+  if (str(values.format) === 'json') {
+    io.out(JSON.stringify(current, null, 2));
+    return EXIT.OK;
+  }
+  const shown = (s: ConfigSetting) => (s.kind === 'boolean' ? (current[s.key] ? 'on' : 'off') : String(current[s.key]));
+  io.out(
+    [
+      `Settings of this machine (${configFile(io.env)}):`,
+      ...Object.entries(CONFIG_KEYS).map(([n, c]) => `  ${n}: ${shown(c)}`),
+    ].join('\n'),
+  );
+  return EXIT.OK;
+}
+
+/** `lr config --project`: the settings a project sets for itself, before the machine's. */
+async function projectConfig(
+  io: Io,
+  root: string | undefined,
+  action: string | undefined,
+  name: string | undefined,
+  value: string | undefined,
+  format: string | undefined,
+): Promise<number> {
+  const home = await retroHome(resolve(io.cwd, root ?? '.'), io.env);
+  if (action === 'set') {
+    const setting = name && PROJECT_CONFIG_KEYS.includes(name) ? CONFIG_KEYS[name] : undefined;
+    if (setting?.kind !== 'choice')
+      throw new UsageError(`a project sets ${PROJECT_CONFIG_KEYS.join(', ')} only, not "${name ?? ''}"`);
+    if (!setting.choices.includes(value ?? ''))
+      throw new UsageError(`${name} takes ${setting.choices.join(' or ')}, not "${value ?? ''}"`);
+    await prepareStoreHome(home);
+    await writeProjectConfig(home, { [setting.key]: value });
+    io.out(`${name} is now ${value} for the project (${home}).`);
+    return EXIT.OK;
+  }
+  if (action !== undefined) throw new UsageError(`lr config takes "set" or nothing, not "${action}"`);
+  const own = await readProjectConfig(home);
+  if (format === 'json') {
+    io.out(JSON.stringify(own, null, 2));
+    return EXIT.OK;
+  }
+  const machine = await readConfig(io.env);
+  io.out(
+    [
+      `Settings of the project (${projectConfigFile(home)}), before the machine's:`,
+      ...PROJECT_CONFIG_KEYS.map((n) => {
+        const key = CONFIG_KEYS[n]!.key as keyof typeof own;
+        return `  ${n}: ${own[key] ?? `not set (the machine's: ${String(machine[key])})`}`;
+      }),
+    ].join('\n'),
+  );
+  return EXIT.OK;
+}
+
+/** A start date: `2026-10-01` (local midnight), an ISO date and time, or `<n>d` (n days ago). */
+export function parseSince(value: string | undefined, now = Date.now()): Date | null {
+  return value === undefined ? null : parseDateOption(value, '--since', now);
+}
+
+/** A date option (see `parseDateArg`), or a usage error naming the option. */
+export function parseDateOption(value: string, flag: string, now = Date.now()): Date {
+  const date = parseDateArg(value, now);
+  if (!date)
+    throw new UsageError(`${flag} must be a date (2026-10-01), a date and time, or a number of days (7d): "${value}"`);
+  return date;
 }
 
 const registryFor = (io: Io) => new SessionRegistry(localReviewHome(io.env));
@@ -437,10 +669,10 @@ async function subscriptions(rest: string[], io: Io): Promise<number> {
  * Refuses to act on a thread that is gone, or that the user changed since the version the agent
  * read (`rev`, when given).
  */
-async function assertCurrent(store: Store, id: string, rev: string | undefined): Promise<void> {
+async function assertCurrent(store: Store, id: string, rev: string | undefined, env: Io['env']): Promise<void> {
   const { state } = await store.loadThread(id);
   const view = state ? agentView(state) : null;
-  if (!view) throw new Error(await whyNotFound(store, id));
+  if (!view) throw new Error(await whyNotFound(store, id, env));
   if (rev === undefined || rev === view.rev) return;
   const located = locate(view, await readWorkingFile(store, view));
   throw new ChangedError(
@@ -449,17 +681,22 @@ async function assertCurrent(store: Store, id: string, rev: string | undefined):
   );
 }
 
-/** Why a thread cannot be found: deleted by the user, or never existed. */
-async function whyNotFound(store: Store, id: string): Promise<string> {
-  let deleted = false;
+/** Why a thread cannot be found: deleted or archived by the user, or never existed. */
+async function whyNotFound(store: Store, id: string, env: Io['env']): Promise<string> {
+  let state: ThreadState | null = null;
   try {
-    deleted = (await store.loadThread(id)).state?.deleted === true;
+    state = (await store.loadThread(id)).state;
   } catch {
     // an invalid id: never existed
   }
-  return deleted
-    ? `Thread not found: ${id} was deleted by the user. Stop working on it; if you already changed code for it, ask the user whether to undo those changes (never undo them on your own).`
-    : `Thread not found: ${id}`;
+  if (state?.deleted)
+    return `Thread not found: ${id} was deleted by the user. Stop working on it; if you already changed code for it, ask the user whether to undo those changes (never undo them on your own).`;
+  if (state?.archived)
+    return `Thread not found: ${id} was archived by the user: it is finished. Stop working on it (lr unarchive ${id} brings it back, only if the user asks).`;
+  // Erased: the user deleted it, and this machine does not keep the history.
+  if (!state && !(await readConfig(env)).keepHistory)
+    return `Thread not found: ${id}. The user may have deleted it (deleted threads are erased on this machine): if you were working on it, stop, and ask the user whether to undo the changes you made for it (never undo them on your own).`;
+  return `Thread not found: ${id}`;
 }
 
 function requireThreadId(positionals: string[]): string {

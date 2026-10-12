@@ -16,6 +16,8 @@ var topicKey = (t) => t.kind === "branch" ? `branch:${t.repo}#${t.branch}` : `pa
 
 // ../../packages/core/src/sessions.ts
 var CURSOR_HEAD_BYTES = 256;
+var CALL_NOTE = "call-";
+var CALL_MAX_AGE_MS = 15 * 6e4;
 function localReviewHome(env = process.env) {
   return env.LOCAL_REVIEW_HOME?.trim() || (0, import_node_path.join)((0, import_node_os.homedir)(), ".local-review");
 }
@@ -73,6 +75,39 @@ var SessionRegistry = class {
     } catch {
       return void 0;
     }
+  }
+  /**
+   * Notes a command an agent starts (e.g. `lr reply …`), written by its adapter before it runs: `lr`
+   * then knows which message of the agent's conversation runs it. Removed by `endCall`, or with the
+   * session.
+   */
+  async startCall(id, call) {
+    await this.setNote(id, `${CALL_NOTE}${call.message}`, JSON.stringify(call));
+  }
+  async endCall(id, message) {
+    await this.takeNote(id, `${CALL_NOTE}${message}`);
+  }
+  /** The commands of a session that are running (as noted by its adapter). */
+  async calls(id) {
+    this.file(id, "json");
+    let names;
+    try {
+      names = await (0, import_promises.readdir)(this.dir);
+    } catch {
+      return [];
+    }
+    const prefix = `${id}.note-${CALL_NOTE}`;
+    const calls = await Promise.all(
+      names.filter((n) => n.startsWith(prefix)).map(async (n) => {
+        try {
+          const raw = JSON.parse(await (0, import_promises.readFile)((0, import_node_path.join)(this.dir, n), "utf8"));
+          return typeof raw.message === "string" && typeof raw.command === "string" && typeof raw.at === "string" ? { message: raw.message, command: raw.command, at: raw.at } : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+    return calls.filter((c) => c !== null);
   }
   note(id, key) {
     if (!SESSION_ID.test(key)) throw new Error(`Invalid note key: ${key}`);
@@ -223,6 +258,31 @@ function parseDelivery(line) {
   }
 }
 
+// ../../packages/core/src/config.ts
+var DEFAULT_CONFIG = {
+  keepHistory: true,
+  retroReminder: true,
+  retroReminderDays: 7,
+  retroReminderSizeKB: 1e3,
+  retroReminderMaxDays: 25,
+  retroSessions: "reports",
+  retroSourceReviews: "ask",
+  retroSourceSessions: "ask",
+  retroSourceAudit: "ask"
+};
+var writing = Promise.resolve();
+
+// ../../packages/core/src/cadence.ts
+var DEFAULT_CADENCE = thresholdsOf(DEFAULT_CONFIG);
+function thresholdsOf(c) {
+  return { days: c.retroReminderDays, bytes: c.retroReminderSizeKB * 1e3, maxDays: c.retroReminderMaxDays };
+}
+
+// ../../packages/core/src/retroGuards.ts
+var STOPWORDS = new Set(
+  "the and for with that this from into when then than are was were has have not use uses using les des une pour avec dans sur par pas que qui est sont aux ses son leur".split(" ")
+);
+
 // src/channel.ts
 var BATCH_MS = 1500;
 var SUPPORTED_PROTOCOLS = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -367,6 +427,12 @@ var import_node_path2 = require("node:path");
 // src/channelFlag.ts
 var CHANNEL = "plugin:local-review@local-review";
 var LAUNCH_WITH_CHANNEL = `claude --dangerously-load-development-channels ${CHANNEL}`;
+
+// src/retroAudit.ts
+var AUDIT_TIMEOUT_MS = 15 * 6e4;
+
+// src/retroInsights.ts
+var INSIGHTS_TIMEOUT_MS = 15 * 6e4;
 
 // src/hook.ts
 function run(cmd, args, cwd) {

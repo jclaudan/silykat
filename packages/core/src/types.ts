@@ -1,9 +1,38 @@
-export const SCHEMA_VERSION = 1;
+/**
+ * The newest format this version reads and writes (`.local-review/schema-version`). Each event says
+ * which format it needs in its own `v` (see `eventVersion`): version 2 added archiving.
+ */
+export const SCHEMA_VERSION = 2;
 export const STORE_DIR = '.local-review';
 
 /** Who wrote an event. `agent` is any AI coding agent (Claude, Codex…), named by the event's `agent` field. */
 export type Author = 'user' | 'agent';
 export type ThreadStatus = 'open' | 'needs-info' | 'addressed' | 'resolved';
+
+/**
+ * Why a thread was deleted: the user removed it (`user`), or its git branch was deleted
+ * (`branch-gone`). Journals written before reasons were recorded have none.
+ */
+export type DeleteReason = 'user' | 'branch-gone';
+export const DELETE_REASONS: readonly DeleteReason[] = ['user', 'branch-gone'];
+
+/**
+ * The agent's conversation a comment was written in: its session (the agent's own id), and when the
+ * agent's integration knows it, the message that wrote the comment (for Claude Code: the id of the
+ * tool call that ran `lr reply`). Lets a retro read the conversation back while the agent keeps it.
+ */
+export interface AgentSessionRef {
+  id: string;
+  message?: string;
+}
+
+/** A valid session reference read from a journal (written by any version or tool), else `undefined`. */
+export function sessionRefOf(raw: unknown): AgentSessionRef | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined;
+  const { id, message } = raw as { id?: unknown; message?: unknown };
+  if (typeof id !== 'string' || id.trim() === '') return undefined;
+  return typeof message === 'string' && message.trim() !== '' ? { id, message } : { id };
+}
 
 /** 1-based, inclusive on both ends. */
 export interface LineRange {
@@ -91,6 +120,13 @@ export interface ThreadState {
   comments: CommentState[];
   createdAt: string;
   deleted: boolean;
+  /**
+   * Archived by the user: finished, and kept out of the editor and of what agents see, but still in
+   * the history and in retros. It can be brought back (unarchived).
+   */
+  archived: boolean;
+  /** When it was last archived; `null` when it is not archived. */
+  archivedAt: string | null;
   /** Written by a newer schema version: never write to it. */
   readOnly: boolean;
   lastAuthor: Author | null;
