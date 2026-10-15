@@ -2,7 +2,7 @@
 
 **A GitHub-style code review between you and Claude Code, 100% local.**
 
-You leave comments on your code in VS Code with the [silykat extension](https://github.com/silykat/silykat#readme), like on a pull request. This plugin lets Claude receive them on its own, change the code, and reply in each thread: done, or a precise question. It also runs **retros** of your work with Claude: it looks back at your review threads, your sessions with Claude and an audit of its setup, and you decide together what to keep, remove or improve in that setup (`CLAUDE.md`, skills, hooks…).
+You leave comments on your code in VS Code with the [silykat extension](https://github.com/silykat/silykat#readme), like on a pull request, or without VS Code in the review pane of Claude Code's desktop app (`/silykat:review-pane`). This plugin lets Claude receive them on its own, change the code, and reply in each thread: done, or a precise question. It also runs **retros** of your work with Claude: it looks back at your review threads, your sessions with Claude and an audit of its setup, and you decide together what to keep, remove or improve in that setup (`CLAUDE.md`, skills, hooks…).
 
 ## Install
 
@@ -12,7 +12,7 @@ claude plugin install silykat@silykat
 claude --dangerously-load-development-channels plugin:silykat@silykat
 ```
 
-The channel is what lets your comments reach Claude by themselves (Claude Code channels are a research preview). Without it, Claude reads the comments when you ask: `/silykat:review`.
+The channel is what lets your comments reach Claude by themselves (Claude Code channels are a research preview). Without it, Claude reads the comments when you ask: `/silykat:review`. In the desktop app, no channel is needed: the review pane's **Send to Claude** hands the comments to the session it is open in.
 
 ## What it adds
 

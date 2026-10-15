@@ -6,7 +6,7 @@
 
 **A GitHub-style code review between you and your AI coding agent, 100% local.**
 
-Select lines in VS Code, leave comments like on a pull request, and your agent reads them, changes the code and answers in the threads. No pull request, no server, no account: comments live next to your code, and nothing leaves your machine (unless you opt in to an online classifier for your retros).
+Select lines in VS Code (or, without VS Code, comment on the diff in the [review pane](#without-vs-code-the-review-pane) of Claude Code's desktop app), leave comments like on a pull request, and your agent reads them, changes the code and answers in the threads. No pull request, no server, no account: comments live next to your code, and nothing leaves your machine (unless you opt in to an online classifier for your retros).
 
 silykat is agent-agnostic by design; **Claude Code** is the first supported agent.
 
@@ -41,6 +41,7 @@ silykat is agent-agnostic by design; **Claude Code** is the first supported agen
 - **Direct comments or reviews**: publish a comment right away, or collect drafts and submit them as one review with a summary.
 - **Threads that follow the code**: they move with the lines, find their code again after external changes, and turn **Outdated** when it is gone, like on GitHub.
 - **Threads that belong to their git branch**: switch branches and you only see that branch's threads; each branch has its own review.
+- **With or without VS Code**: in Claude Code's desktop app (or its terminal), the review pane (`/silykat:review-pane`) shows the diff of your working tree, takes your comments on it and hands them to Claude: the same threads as in VS Code.
 - **Your agent does the work**: it receives what you publish, changes the code, replies in each thread, and tells you what it did or what it needs.
 - **The right agent gets it**: with several agent sessions in parallel (one per git worktree, a reviewer next to a developer…), each comment goes to the sessions working on its branch.
 - **Safe while the agent works**: edit or delete a comment at any time; the agent never answers an outdated version.
@@ -50,11 +51,13 @@ silykat is agent-agnostic by design; **Claude Code** is the first supported agen
 
 ## Requirements
 
-- **VS Code** 1.100 or later (or an editor based on it: see [Other editors based on VS Code](#other-editors-based-on-vs-code-cursor-vscodium-windsurf)).
-- **git**. To build the extension from source instead of installing it from a marketplace: **Node.js** 22.12 or later, with **npm** 11.10 or later.
-- For the agent integration: **Claude Code** in a terminal, logged in with a claude.ai account (Pro or Max) or a Console API key. Team and Enterprise organizations must enable channels (see [Known limitations](#known-limitations)).
+- **VS Code** 1.100 or later (or an editor based on it: see [Other editors based on VS Code](#other-editors-based-on-vs-code-cursor-vscodium-windsurf)). Without VS Code: Claude Code's desktop app, or Claude Code in a terminal, with the [review pane](#without-vs-code-the-review-pane).
+- **git**. To build the extension from source instead of installing it from a marketplace: **Node.js** 22.12 or later, with **npm** 11.10 or later. The review pane runs the bundled `slk` with **Node.js**: `node` must be on your `PATH`.
+- For the agent integration: **Claude Code** in a terminal or its desktop app, logged in with a claude.ai account (Pro or Max) or a Console API key. Team and Enterprise organizations must enable channels (see [Known limitations](#known-limitations)).
 
 ## Installation
+
+Without VS Code (Claude Code's desktop app), only [the Claude Code plugin](#2-the-claude-code-plugin) is needed: the review pane takes the place of the extension, and of the channel, since it hands the comments to the session it is open in.
 
 ### 1. The VS Code extension
 
@@ -117,6 +120,8 @@ At each launch, Claude Code warns about development channels: choose **I am usin
 3. In VS Code, select the lines you want to comment on and press **`Ctrl+Cmd+C`** (`Ctrl+Alt+C` on Windows/Linux), or right-click → **silykat: Comment on Selection**. Type your comment and click **Comment**.
 4. Claude receives it within seconds, changes the code and replies in the thread: **✅ Addressed by Claude — please verify**, or **❓ Claude is waiting for your reply**. The first time, Claude asks to use the `silykat:review` skill: allow it for good.
 5. Check the change, reply if needed, and **Resolve** the thread (✓ in its header). Only you resolve threads.
+
+Without VS Code, in Claude Code's desktop app: ask Claude to change something, then run **`/silykat:review-pane`**, type your comment under a hunk of the diff, and press **Send to Claude**. Claude replies in the thread; reply or **Resolve** it in the pane.
 
 ## Using silykat
 
@@ -211,7 +216,7 @@ A session started without the channel (plain `claude`, or the Claude Code panel 
 
 In Claude Code itself (the desktop app's Code tab, or the terminal), **`/silykat:review-pane`** opens a pane with the diff of your working tree against `HEAD`, file by file, new files included. Type a comment under a hunk to start a thread on the lines it changed, or in **Other lines** (`12-15 your comment`, or a comment on the whole file). The open threads are listed under the diff: reply, or **Resolve**. **Send to Claude** asks the session to handle the threads waiting for it with the `silykat:review` skill; the pane reads the threads again after each of its turns.
 
-They are the same threads as in VS Code (the pane writes them with `slk review comment`), so you can start a review in one and finish it in the other. The pane has no review mode (drafts) and comments on the working tree only.
+They are the same threads as in VS Code (the pane writes them with `slk review comment`), so you can start a review in one and finish it in the other. What it does not do yet: see [Known limitations](#known-limitations).
 
 ## Retros
 
@@ -281,23 +286,25 @@ The agent's reminder runs outside VS Code: when you change a `retroReminder` set
 
 Agents read and answer the threads with `slk`, an agent-neutral command line; the Claude Code plugin puts it on Claude's `PATH`. You rarely need it yourself, but it is handy to see what the agent sees:
 
-| Command                                                                   | What it does                                                                               |
-| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `slk review status`                                                       | How many threads wait for the agent, and for you                                           |
-| `slk review list [--all] [--thread <id>]…`                                | The threads waiting for the agent, with their current code                                 |
-| `slk review show <thread-id>`                                             | One thread in full                                                                         |
-| `slk review reply <thread-id> --agent <name> --rev <v> --body -`          | Reply (body on stdin), optionally `--status addressed\|needs-info`                         |
-| `slk subscribe [<folder>] [--path]`, `slk unsubscribe`                    | Subscribe the session `slk` runs in to a branch or a path, or stop                         |
-| `slk subscriptions`, `slk sessions`                                       | What this session is subscribed to; the running sessions                                   |
-| `slk review history [--since <date>] [--out <file>]`                      | Every thread of the project, whatever its state, in full (export)                          |
-| `slk review archive <id>…`, `slk review archive --resolved-before <date>` | Archive threads (`--list`: the archived ones); `slk review unarchive <id>…`                |
-| `slk review purge --before <date> [--yes]`                                | Delete old finished threads for good (without `--yes`: only says which)                    |
-| `slk review purge --history [--yes]`                                      | Erase the history kept: deleted threads, threads saved from worktrees                      |
-| `slk worktree save [<folder>]`                                            | Save a git worktree's threads before removing the worktree                                 |
-| `slk config`, `slk config set <name> <value>`                             | The settings of this machine (`keep-history`, retro reminder, `retro-sessions`, sources)   |
-| `slk config --project`, `slk retro sources`                               | The settings of the project (the sources of its retros), before the machine's              |
-| `slk retro scope`, `slk retro show <id>`, `slk retro list`                | What a retro would cover; a retro and its proposals (`--next`: one at a time); past retros |
-| `slk retro cadence`                                                       | Is a retro due? Days, size of the threads and sessions since the last retro                |
+| Command                                                                     | What it does                                                                               |
+| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `slk review status`                                                         | How many threads wait for the agent, and for you                                           |
+| `slk review list [--all] [--thread <id>]…`                                  | The threads waiting for the agent, with their current code                                 |
+| `slk review show <thread-id>`                                               | One thread in full                                                                         |
+| `slk review reply <thread-id> --agent <name> --rev <v> --body -`            | Reply (body on stdin), optionally `--status addressed\|needs-info`                         |
+| `slk review comment <file> [--lines <a>-<b>] --body <text>`                 | Your side without VS Code: a new thread on those lines (none: the whole file)              |
+| `slk review comment --thread <id> --body <text>`, `slk review resolve <id>` | Your reply in a thread; resolve it                                                         |
+| `slk subscribe [<folder>] [--path]`, `slk unsubscribe`                      | Subscribe the session `slk` runs in to a branch or a path, or stop                         |
+| `slk subscriptions`, `slk sessions`                                         | What this session is subscribed to; the running sessions                                   |
+| `slk review history [--since <date>] [--out <file>]`                        | Every thread of the project, whatever its state, in full (export)                          |
+| `slk review archive <id>…`, `slk review archive --resolved-before <date>`   | Archive threads (`--list`: the archived ones); `slk review unarchive <id>…`                |
+| `slk review purge --before <date> [--yes]`                                  | Delete old finished threads for good (without `--yes`: only says which)                    |
+| `slk review purge --history [--yes]`                                        | Erase the history kept: deleted threads, threads saved from worktrees                      |
+| `slk worktree save [<folder>]`                                              | Save a git worktree's threads before removing the worktree                                 |
+| `slk config`, `slk config set <name> <value>`                               | The settings of this machine (`keep-history`, retro reminder, `retro-sessions`, sources)   |
+| `slk config --project`, `slk retro sources`                                 | The settings of the project (the sources of its retros), before the machine's              |
+| `slk retro scope`, `slk retro show <id>`, `slk retro list`                  | What a retro would cover; a retro and its proposals (`--next`: one at a time); past retros |
+| `slk retro cadence`                                                         | Is a retro due? Days, size of the threads and sessions since the last retro                |
 
 Add `--root <folder>` to target a project from elsewhere (`--root /` for files outside the open folders), and `--format json` for tools. `slk --help` has the full reference.
 
@@ -321,6 +328,7 @@ Add `--root <folder>` to target a project from elsewhere (`--root /` for files o
 
 - **Channels are a Claude Code research preview**: the launch flag may change, Claude Code warns at each launch, and Team and Enterprise organizations must enable channels (an admin setting). Without the channel, comments wait until you ask Claude.
 - **The Claude Code panel of VS Code** cannot be launched with a channel: use Claude Code in a terminal, or ask `/silykat:review` in the panel.
+- **The review pane** comments on the working tree only (not on a commit or the staged changes), has no review mode (drafts), and cannot edit or delete a comment: use VS Code for those. It is built on Claude Code's function hooks, an early-access API that may change between Claude Code releases.
 - **Files outside the open folders** have no git features (comments on a diff side, following a rename with git).
 - **A rebase in progress**: threads follow the branch being rebased, but commenting during a rebase is not supported yet.
 - **Retros** are run by Claude Code for now; the time announced is a rough estimate, to be refined on real retros. They read back only the conversations of replies written since silykat links them, and only on the machine where they ran, while Claude Code keeps them.
