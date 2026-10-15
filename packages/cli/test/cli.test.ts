@@ -459,3 +459,76 @@ describe('slk from a folder without a store', () => {
     expect((await slk(['review', 'status', '--root', repo], { env })).out).toContain('1 thread waiting for you');
   });
 });
+
+describe('slk review comment / resolve (the user, from an editor other than VS Code)', () => {
+  it('starts a thread on lines of a file, which the agent then sees waiting for it', async () => {
+    const made = await slk(['review', 'comment', 'src/find.ts', '--lines', '2-3', '--body', 'Throw when missing']);
+    expect(made.code).toBe(EXIT.OK);
+    const { threads } = await store.loadAll();
+    expect(threads).toHaveLength(1);
+    const [t] = threads;
+    expect(made.out).toBe(`Commented ${t!.id} (status: open).\n`);
+    expect(t!.anchor).toMatchObject({ path: 'src/find.ts', source: 'worktree', ref: null, sha: null });
+    expect(t!.anchor.range).toEqual({ startLine: 2, endLine: 3 });
+    expect(t!.anchor.snippet).toBe('  const user = db.get(id);\n  if (!user) return null;');
+    expect(t!.comments[0]).toMatchObject({ author: 'user', body: 'Throw when missing', isDraft: false });
+    expect((await slk(['review', 'status'])).out).toContain('1 thread waiting for you');
+  });
+
+  it('comments on a whole file without --lines, and answers in JSON', async () => {
+    const r = await slk(['review', 'comment', 'src/find.ts', '--body', 'Split this file', '--format', 'json']);
+    const { id, status } = JSON.parse(r.out) as { id: string; status: string };
+    expect(status).toBe('open');
+    const { threads } = await store.loadAll();
+    expect(threads.map((t) => [t.id, t.anchor.range])).toEqual([[id, null]]);
+  });
+
+  it('adds the reply of the user to a thread, then resolves it', async () => {
+    const t = await comment(anchorOn(3, 3), 'Throw here');
+    await slk(['review', 'reply', t.id, '--agent', 'Claude', '--body', 'Which error?', '--status', 'needs-info']);
+    const replied = await slk(['review', 'comment', '--thread', t.id, '--body', 'A NotFoundError']);
+    expect(replied.out).toBe(`Replied on ${t.id} (status: open).\n`);
+    expect((await slk(['review', 'list'])).out).toContain('A NotFoundError');
+
+    expect((await slk(['review', 'resolve', t.id])).out).toBe(`${t.id} is now resolved.\n`);
+    expect((await slk(['review', 'list', '--all'])).out).toContain('No unresolved thread.');
+  });
+
+  it('refuses a body missing, a bad range, a file it cannot read, or a file outside the root', async () => {
+    expect((await slk(['review', 'comment', 'src/find.ts'])).err).toContain('comment needs --body');
+    expect((await slk(['review', 'comment', 'src/find.ts', '--lines', '5-2', '--body', 'x'])).err).toContain(
+      '--lines must be a line or a range',
+    );
+    expect((await slk(['review', 'comment', 'src/nope.ts', '--body', 'x'])).err).toContain('cannot read');
+    const other = await mkdtemp(join(tmpdir(), 'slk-other-'));
+    try {
+      await writeFile(join(other, 'a.ts'), 'a\n');
+      const r = await slk(['review', 'comment', join(other, 'a.ts'), '--body', 'x']);
+      expect(r.code).toBe(EXIT.ERROR);
+      expect(r.err).toContain('pass --root');
+    } finally {
+      await rm(other, { recursive: true, force: true });
+    }
+    expect((await slk(['review', 'comment', 'src/find.ts', '--root', 'nowhere', '--body', 'x'])).err).toContain(
+      'no such folder: nowhere',
+    );
+    expect((await slk(['review', 'comment', '--thread', 't', '--lines', '1', '--body', 'x'])).err).toContain(
+      'a reply (--thread) takes no file nor --lines',
+    );
+    expect((await slk(['review', 'comment', '--body', 'x'])).err).toContain('missing <file>');
+    expect((await slk(['review', 'comment', 'a', 'b', '--body', 'x'])).err).toContain('takes one file');
+    expect((await store.loadAll()).threads).toHaveLength(0);
+  });
+
+  it('keeps .silykat/ out of git, in the repository of the file', async () => {
+    const { execFileSync } = await import('node:child_process');
+    execFileSync('git', ['init', '-q', '-b', 'main'], { cwd: root });
+    const r = await slk(['review', 'comment', 'find.ts', '--lines', '1', '--body', 'Rename'], {
+      cwd: join(root, 'src'),
+    });
+    expect(r.err).toBe('');
+    expect(await readFile(join(root, '.git', 'info', 'exclude'), 'utf8')).toContain('.silykat/');
+    const [t] = (await store.loadAll()).threads;
+    expect(t!.anchor.path).toBe('src/find.ts');
+  });
+});

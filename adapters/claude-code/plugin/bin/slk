@@ -60,8 +60,27 @@ var newCommentId = () => `c_${ulid()}`;
 var newReviewId = () => `r_${ulid()}`;
 
 // ../core/src/anchorContext.ts
+var CONTEXT_LINES = 3;
 function splitLines(text) {
   return text.split(/\r\n|\r|\n/);
+}
+function clampRange(range, lineCount) {
+  const max = Math.max(1, lineCount);
+  const startLine = Math.min(Math.max(1, range.startLine), max);
+  const endLine = Math.min(Math.max(startLine, range.endLine), max);
+  return { startLine, endLine };
+}
+function buildAnchorContext(fileText, range) {
+  const lines = splitLines(fileText);
+  const r = clampRange(range, lines.length);
+  const start2 = r.startLine - 1;
+  const end = r.endLine;
+  return {
+    range: r,
+    snippet: lines.slice(start2, end).join("\n"),
+    contextBefore: lines.slice(Math.max(0, start2 - CONTEXT_LINES), start2),
+    contextAfter: lines.slice(end, end + CONTEXT_LINES)
+  };
 }
 
 // ../core/src/events.ts
@@ -665,12 +684,12 @@ var Store = class {
     const who3 = actor(by, agent);
     const current = await this.writableThread(threadId, by);
     assertOwnComment(current, commentId, by);
-    const comment = current.comments.find((c) => c.id === commentId);
-    if (comment.body === text) return current;
+    const comment2 = current.comments.find((c) => c.id === commentId);
+    if (comment2.body === text) return current;
     const at = (/* @__PURE__ */ new Date()).toISOString();
     const events = [{ v: FIRST_VERSION, type: "comment.edited", at, ...who3, commentId, body: text }];
     const handled = current.status === "addressed" || current.status === "needs-info";
-    if (by === "user" && !comment.isDraft && handled)
+    if (by === "user" && !comment2.isDraft && handled)
       events.push({ v: FIRST_VERSION, type: "status.changed", at, ...who3, status: "open" });
     return this.appendAndReload(threadId, events);
   }
@@ -863,9 +882,9 @@ function actor(by, agent) {
   return { by, agent: name };
 }
 function assertOwnComment(thread, commentId, by) {
-  const comment = thread.comments.find((c) => c.id === commentId);
-  if (!comment) throw new Error(`Comment not found: ${commentId}`);
-  if (comment.author !== by) throw new Error("You can only change your own comments");
+  const comment2 = thread.comments.find((c) => c.id === commentId);
+  if (!comment2) throw new Error(`Comment not found: ${commentId}`);
+  if (comment2.author !== by) throw new Error("You can only change your own comments");
 }
 function assertCanSetStatus(status2, by) {
   if (status2 === "resolved" && by !== "user") throw new Error("Only the user can resolve a thread");
@@ -5267,6 +5286,14 @@ Review (the comment threads of the project):
            --rev: the version you read (slk review list / slk review show): refused, exit 3, if the user changed
            the thread since. Exit 2: the thread no longer exists (e.g. deleted by the user).
 
+The user's side, for an editor other than VS Code (e.g. the pane of Claude Code's desktop app):
+  slk review comment <file> [--lines <n>|<a>-<b>] (--body <markdown> | --body-file <path> | --body -)
+           [--format md|json]           A new thread on those lines of the working tree (no --lines:
+                                          on the whole file)
+  slk review comment --thread <thread-id> (--body \u2026 ) [--format md|json]
+                                          The user's reply in a thread
+  slk review resolve <thread-id>          The user marks a thread resolved
+
 History of the review (every thread, whatever its state: open, addressed, resolved, deleted, archived or
 not):
   slk review history [--since <date>] [--format md|json] [--out <file>]
@@ -5378,6 +5405,10 @@ async function review(args, io) {
       return await reply(rest, io);
     case "set-status":
       return await setStatus(rest, io);
+    case "comment":
+      return await comment(rest, io);
+    case "resolve":
+      return await resolveThread(rest, io);
     case "history":
       return await history(rest, io);
     case "archive":
@@ -5503,11 +5534,7 @@ async function reply(rest, io) {
   const id = requireThreadId(positionals);
   const agent = requireAgent(str(values.agent), io);
   const status2 = str(values.status) === void 0 ? void 0 : agentStatus(str(values.status));
-  let body2 = str(values.body);
-  if (body2 === "-") body2 = await io.readStdin();
-  const bodyFile = str(values["body-file"]);
-  if (bodyFile) body2 = await (0, import_promises18.readFile)((0, import_node_path22.resolve)(io.cwd, bodyFile), "utf8");
-  if (body2 === void 0 || body2.trim() === "") throw new UsageError("reply needs --body, --body-file or --body -");
+  const body2 = await readBody(values, io, "reply");
   const store = openStore(str(values.root), io);
   await assertCurrent(store, id, str(values.rev), io.env);
   const session2 = await replySession(id, values, io);
@@ -5517,6 +5544,86 @@ async function reply(rest, io) {
     status2 ? { status: status2 } : {}
   );
   io.out(`Replied on ${state.id} (status: ${state.status}).`);
+  return EXIT.OK;
+}
+async function readBody(values, io, command) {
+  let body2 = str(values.body);
+  if (body2 === "-") body2 = await io.readStdin();
+  const bodyFile = str(values["body-file"]);
+  if (bodyFile) body2 = await (0, import_promises18.readFile)((0, import_node_path22.resolve)(io.cwd, bodyFile), "utf8");
+  if (body2 === void 0 || body2.trim() === "")
+    throw new UsageError(`${command} needs --body, --body-file or --body -`);
+  return body2;
+}
+async function comment(rest, io) {
+  const { values, positionals } = parse(rest, {
+    lines: { type: "string" },
+    thread: { type: "string" },
+    body: { type: "string" },
+    "body-file": { type: "string" },
+    format: { type: "string" }
+  });
+  const body2 = await readBody(values, io, "comment");
+  const threadId = str(values.thread);
+  if (threadId !== void 0) {
+    if (positionals.length > 0 || values.lines !== void 0)
+      throw new UsageError("a reply (--thread) takes no file nor --lines");
+    const state2 = await openStore(str(values.root), io).addComment(threadId, { author: "user", body: body2, reviewId: null });
+    return commented(state2, "Replied on", values, io);
+  }
+  const [path, extra] = positionals;
+  if (!path) throw new UsageError("missing <file> (or --thread <id> to reply)");
+  if (extra !== void 0) throw new UsageError(`slk review comment takes one file: "${extra}"`);
+  const given = (0, import_node_path22.resolve)(io.cwd, path);
+  const text = await (0, import_promises18.readFile)(given, "utf8").catch(() => {
+    throw new Error(`cannot read ${given}`);
+  });
+  const file = await (0, import_promises18.realpath)(given);
+  const worktree2 = await gitWorktreeOf(file);
+  const rootArg = str(values.root);
+  const root = await (0, import_promises18.realpath)(
+    rootArg ? (0, import_node_path22.resolve)(io.cwd, rootArg) : findStoreRoot((0, import_node_path22.dirname)(file), io.env) ?? worktree2?.worktree ?? io.cwd
+  ).catch(() => {
+    throw new Error(`no such folder: ${rootArg}`);
+  });
+  if (!isWithin(file, root)) throw new Error(`${file} is not inside ${root}: pass --root <dir>`);
+  const lines = str(values.lines);
+  const anchor = {
+    path: (0, import_node_path22.relative)(root, file).split(import_node_path22.sep).join("/"),
+    source: "worktree",
+    ref: null,
+    sha: null,
+    // No --lines: a comment on the whole file.
+    ...lines === void 0 ? { range: null, snippet: "", contextBefore: [], contextAfter: [] } : buildAnchorContext(text, lineRange(lines))
+  };
+  await prepareStoreHome(root);
+  const store = storeAt(root, io.env);
+  const state = await store.createThread(
+    anchor,
+    { author: "user", body: body2, reviewId: null },
+    branchOfTopic(await topicOf(file))
+  );
+  return commented(state, "Commented", values, io);
+}
+function commented(state, verb, values, io) {
+  io.out(
+    str(values.format) === "json" ? JSON.stringify({ id: state.id, status: state.status }, null, 2) : `${verb} ${state.id} (status: ${state.status}).`
+  );
+  return EXIT.OK;
+}
+function lineRange(value) {
+  const m = /^(\d+)(?:-(\d+))?$/.exec(value.trim());
+  const startLine = Number(m?.[1]);
+  const endLine = Number(m?.[2] ?? m?.[1]);
+  if (!m || startLine < 1 || endLine < startLine)
+    throw new UsageError(`--lines must be a line or a range such as 3-7, not "${value}"`);
+  return { startLine, endLine };
+}
+async function resolveThread(rest, io) {
+  const { values, positionals } = parse(rest, {});
+  const id = requireThreadId(positionals);
+  const state = await openStore(str(values.root), io).setStatus(id, "resolved", "user");
+  io.out(`${state.id} is now ${state.status}.`);
   return EXIT.OK;
 }
 async function replySession(threadId, values, io) {

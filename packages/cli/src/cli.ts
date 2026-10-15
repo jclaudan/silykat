@@ -1,7 +1,10 @@
-import { readFile, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { readFile, realpath, writeFile } from 'node:fs/promises';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import {
   agentView,
+  buildAnchorContext,
+  gitWorktreeOf,
+  type Anchor,
   callFor,
   CONFIG_KEYS,
   PROJECT_CONFIG_KEYS,
@@ -85,6 +88,14 @@ Review (the comment threads of the project):
   slk review set-status <thread-id> addressed|needs-info --agent <name> [--rev <version>]
            --rev: the version you read (slk review list / slk review show): refused, exit 3, if the user changed
            the thread since. Exit 2: the thread no longer exists (e.g. deleted by the user).
+
+The user's side, for an editor other than VS Code (e.g. the pane of Claude Code's desktop app):
+  slk review comment <file> [--lines <n>|<a>-<b>] (--body <markdown> | --body-file <path> | --body -)
+           [--format md|json]           A new thread on those lines of the working tree (no --lines:
+                                          on the whole file)
+  slk review comment --thread <thread-id> (--body … ) [--format md|json]
+                                          The user's reply in a thread
+  slk review resolve <thread-id>          The user marks a thread resolved
 
 History of the review (every thread, whatever its state: open, addressed, resolved, deleted, archived or
 not):
@@ -200,6 +211,10 @@ async function review(args: string[], io: Io): Promise<number> {
       return await reply(rest, io);
     case 'set-status':
       return await setStatus(rest, io);
+    case 'comment':
+      return await comment(rest, io);
+    case 'resolve':
+      return await resolveThread(rest, io);
     case 'history':
       return await history(rest, io);
     case 'archive':
@@ -356,11 +371,7 @@ async function reply(rest: string[], io: Io): Promise<number> {
   const id = requireThreadId(positionals);
   const agent = requireAgent(str(values.agent), io);
   const status = str(values.status) === undefined ? undefined : agentStatus(str(values.status));
-  let body = str(values.body);
-  if (body === '-') body = await io.readStdin();
-  const bodyFile = str(values['body-file']);
-  if (bodyFile) body = await readFile(resolve(io.cwd, bodyFile), 'utf8');
-  if (body === undefined || body.trim() === '') throw new UsageError('reply needs --body, --body-file or --body -');
+  const body = await readBody(values, io, 'reply');
 
   const store = openStore(str(values.root), io);
   await assertCurrent(store, id, str(values.rev), io.env);
@@ -371,6 +382,107 @@ async function reply(rest: string[], io: Io): Promise<number> {
     status ? { status } : {},
   );
   io.out(`Replied on ${state.id} (status: ${state.status}).`);
+  return EXIT.OK;
+}
+
+/** The text of `--body <markdown>`, `--body -` (stdin) or `--body-file <path>`; never empty. */
+async function readBody(values: Values, io: Io, command: string): Promise<string> {
+  let body = str(values.body);
+  if (body === '-') body = await io.readStdin();
+  const bodyFile = str(values['body-file']);
+  if (bodyFile) body = await readFile(resolve(io.cwd, bodyFile), 'utf8');
+  if (body === undefined || body.trim() === '')
+    throw new UsageError(`${command} needs --body, --body-file or --body -`);
+  return body;
+}
+
+/**
+ * `slk review comment`: the user's side, for an editor other than VS Code (e.g. the pane of Claude
+ * Code's desktop app). A new thread on lines of a file of the working tree, as the extension makes it,
+ * or with `--thread` a reply of the user in a thread. Nothing is delivered to agent sessions: the
+ * caller hands the threads to its agent.
+ */
+async function comment(rest: string[], io: Io): Promise<number> {
+  const { values, positionals } = parse(rest, {
+    lines: { type: 'string' },
+    thread: { type: 'string' },
+    body: { type: 'string' },
+    'body-file': { type: 'string' },
+    format: { type: 'string' },
+  });
+  const body = await readBody(values, io, 'comment');
+  const threadId = str(values.thread);
+  if (threadId !== undefined) {
+    if (positionals.length > 0 || values.lines !== undefined)
+      throw new UsageError('a reply (--thread) takes no file nor --lines');
+    const state = await openStore(str(values.root), io).addComment(threadId, { author: 'user', body, reviewId: null });
+    return commented(state, 'Replied on', values, io);
+  }
+
+  const [path, extra] = positionals;
+  if (!path) throw new UsageError('missing <file> (or --thread <id> to reply)');
+  if (extra !== undefined) throw new UsageError(`slk review comment takes one file: "${extra}"`);
+  const given = resolve(io.cwd, path);
+  const text = await readFile(given, 'utf8').catch(() => {
+    throw new Error(`cannot read ${given}`);
+  });
+  // Real paths on both sides: git gives long paths, a folder may be a link or (Windows) a short name.
+  const file = await realpath(given);
+  const worktree = await gitWorktreeOf(file);
+  const rootArg = str(values.root);
+  const root = await realpath(
+    rootArg ? resolve(io.cwd, rootArg) : (findStoreRoot(dirname(file), io.env) ?? worktree?.worktree ?? io.cwd),
+  ).catch(() => {
+    throw new Error(`no such folder: ${rootArg}`);
+  });
+  if (!isWithin(file, root)) throw new Error(`${file} is not inside ${root}: pass --root <dir>`);
+
+  const lines = str(values.lines);
+  const anchor: Anchor = {
+    path: relative(root, file).split(sep).join('/'),
+    source: 'worktree',
+    ref: null,
+    sha: null,
+    // No --lines: a comment on the whole file.
+    ...(lines === undefined
+      ? { range: null, snippet: '', contextBefore: [], contextAfter: [] }
+      : buildAnchorContext(text, lineRange(lines))),
+  };
+  await prepareStoreHome(root); // .silykat/ in .git/info/exclude, as the extension does
+  const store = storeAt(root, io.env);
+  const state = await store.createThread(
+    anchor,
+    { author: 'user', body, reviewId: null },
+    branchOfTopic(await topicOf(file)),
+  );
+  return commented(state, 'Commented', values, io);
+}
+
+function commented(state: ThreadState, verb: string, values: Values, io: Io): number {
+  io.out(
+    str(values.format) === 'json'
+      ? JSON.stringify({ id: state.id, status: state.status }, null, 2)
+      : `${verb} ${state.id} (status: ${state.status}).`,
+  );
+  return EXIT.OK;
+}
+
+/** `3` or `3-7`: 1-based, inclusive. */
+function lineRange(value: string): { startLine: number; endLine: number } {
+  const m = /^(\d+)(?:-(\d+))?$/.exec(value.trim());
+  const startLine = Number(m?.[1]);
+  const endLine = Number(m?.[2] ?? m?.[1]);
+  if (!m || startLine < 1 || endLine < startLine)
+    throw new UsageError(`--lines must be a line or a range such as 3-7, not "${value}"`);
+  return { startLine, endLine };
+}
+
+/** `slk review resolve <thread-id>`: the user marks a thread done (agents never resolve). */
+async function resolveThread(rest: string[], io: Io): Promise<number> {
+  const { values, positionals } = parse(rest, {});
+  const id = requireThreadId(positionals);
+  const state = await openStore(str(values.root), io).setStatus(id, 'resolved', 'user');
+  io.out(`${state.id} is now ${state.status}.`);
   return EXIT.OK;
 }
 
