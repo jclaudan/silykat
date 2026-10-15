@@ -10,6 +10,7 @@
   "homepage": "https://github.com/silykat/silykat#readme",
   "repository": "https://github.com/silykat/silykat",
   "license": "MIT",
+  "types": "./types/index.d.ts",
   "keywords": [
     "code review",
     "review",

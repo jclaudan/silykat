@@ -19,6 +19,7 @@ The channel is what lets your comments reach Claude by themselves (Claude Code c
 - **Skills**: `/silykat:review` (address the review comments and reply in their threads) and `/silykat:retro` (run a retro).
 - **Commands**: `/silykat:subscribe` and `/silykat:unsubscribe` (which branch or folder this session receives comments for).
 - **Agents**: the `silykat:retro-*` sub-agents that classify, read and analyse the sources of a retro, and apply the changes you validate.
+- **The review pane**: `/silykat:review-pane` (comment on the diff of the working tree and hand the threads to Claude, without VS Code: in the desktop app or the terminal).
 - **The `slk` command line** (`bin/slk`), on Claude's PATH: it reads and answers threads and keeps the retros' journals.
 
 ## What it runs and where your data goes

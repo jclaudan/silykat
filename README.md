@@ -207,6 +207,12 @@ Editing or deleting a published comment tells the subscribed sessions too. Claud
 
 A session started without the channel (plain `claude`, or the Claude Code panel of VS Code) still receives the comments, but only sees them when you ask it (`/silykat:review`). VS Code tells you once, with the command to relaunch it, and marks the session with ⚠ in the status bar. To send nothing to the sessions at all, turn off `silykat.pushToAgents`.
 
+### Without VS Code: the review pane
+
+In Claude Code itself (the desktop app's Code tab, or the terminal), **`/silykat:review-pane`** opens a pane with the diff of your working tree against `HEAD`, file by file, new files included. Type a comment under a hunk to start a thread on the lines it changed, or in **Other lines** (`12-15 your comment`, or a comment on the whole file). The open threads are listed under the diff: reply, or **Resolve**. **Send to Claude** asks the session to handle the threads waiting for it with the `silykat:review` skill; the pane reads the threads again after each of its turns.
+
+They are the same threads as in VS Code (the pane writes them with `slk review comment`), so you can start a review in one and finish it in the other. The pane has no review mode (drafts) and comments on the working tree only.
+
 ## Retros
 
 A retro is a look back at your work with your agent since the last retro (the review feedback you gave it, your sessions with it, its setup), to improve its setup from what really happened, like a sprint retro with your agent. It is a discussion: nothing changes without your say-so, and what you validate, Claude applies.
